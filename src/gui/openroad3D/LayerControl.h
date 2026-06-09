@@ -31,6 +31,10 @@ struct LayerSettings {
   QColor color;
   bool visible = true;
   bool selectable = true;
+  // Visual style for layer icon
+  Qt::BrushStyle fillStyle = Qt::SolidPattern;      // Fill pattern (stipple)
+  Qt::PenStyle borderStyle = Qt::SolidLine;          // Border line style
+  float borderWidth = 1.0f;                        // Border line width
 };
 
 // Callback when layer settings change

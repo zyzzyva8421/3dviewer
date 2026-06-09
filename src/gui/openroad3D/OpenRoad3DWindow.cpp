@@ -11,6 +11,8 @@
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QWidget>
+#include <unordered_map>
+#include <unordered_set>
 #include <set>
 
 #include "LayerControl.h"
@@ -86,6 +88,11 @@ void OpenRoad3DWindow::setupUi() {
   toolbarLayout->addWidget(showInstCheck_);
   toolbarLayout->addWidget(showWireCheck_);
   toolbarLayout->addWidget(showViaCheck_);
+  toolbarLayout->addSpacing(8);
+  toolbarLayout->addWidget(new QLabel("Names:", mainArea));
+  showNamesCheck_ = new QCheckBox("Show", mainArea);
+  showNamesCheck_->setChecked(false);
+  toolbarLayout->addWidget(showNamesCheck_);
   toolbarLayout->addStretch();
   toolbarLayout->addWidget(statusLabel_);
 
@@ -214,6 +221,11 @@ void OpenRoad3DWindow::setupUi() {
   connect(showInstCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
   connect(showWireCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
   connect(showViaCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
+  connect(showNamesCheck_, &QCheckBox::toggled, this, [this](bool checked) {
+    if (backend_) {
+      backend_->setDisplayNamesVisible(checked);
+    }
+  });
 
   // Connect signals - layer control
   connect(layerControl_, &LayerControl::layerVisibilityChanged, this, &OpenRoad3DWindow::onLayerVisibilityChanged);
@@ -229,13 +241,104 @@ void OpenRoad3DWindow::refreshView() {
   statusLabel_->setText("Loading...");
 
   // Build scene from database
-  snapshot_ = sceneBuilder_->build();
+  viewer3d::domain::SceneSnapshot newSnapshot = sceneBuilder_->build();
 
   // Update backend with new scene
   if (backend_) {
-    backend_->loadScene(snapshot_);
-    for (const auto& layer : snapshot_.layers) {
-      backend_->updateLayerState(layer);
+    if (!sceneLoaded_) {
+      snapshot_ = std::move(newSnapshot);
+      backend_->loadScene(snapshot_);
+      sceneLoaded_ = true;
+    } else {
+      auto objectRecordEqual = [](const viewer3d::domain::ObjectRecord& a,
+                                  const viewer3d::domain::ObjectRecord& b) {
+        return a.objectId == b.objectId && a.type == b.type && a.layerId == b.layerId
+               && a.groupId == b.groupId && a.visible == b.visible
+               && a.transform == b.transform && a.bboxMin == b.bboxMin
+               && a.bboxMax == b.bboxMax && a.hasBbox == b.hasBbox
+               && a.geometryRef == b.geometryRef && a.styleRef == b.styleRef
+               && a.displayName == b.displayName;
+      };
+
+            auto layerRecordEqual = [](const viewer3d::domain::LayerRecord& a,
+                   const viewer3d::domain::LayerRecord& b) {
+         return a.layerId == b.layerId && a.name == b.name && a.zBase == b.zBase
+           && a.thickness == b.thickness && a.visible == b.visible
+           && a.selectable == b.selectable && a.color.r == b.color.r
+           && a.color.g == b.color.g && a.color.b == b.color.b
+           && a.color.a == b.color.a && a.stippleId == b.stippleId
+           && a.transparency == b.transparency && a.lighten == b.lighten
+           && a.lineWidth == b.lineWidth && a.lineStyle == b.lineStyle;
+            };
+
+      std::unordered_map<std::string, viewer3d::domain::ObjectRecord> oldById;
+      oldById.reserve(snapshot_.objects.size());
+      for (const auto& obj : snapshot_.objects) {
+        oldById.emplace(obj.objectId, obj);
+      }
+
+      std::unordered_set<std::string> newIds;
+      newIds.reserve(newSnapshot.objects.size());
+      std::vector<viewer3d::domain::ObjectRecord> changedOrAdded;
+      changedOrAdded.reserve(newSnapshot.objects.size());
+
+      for (const auto& obj : newSnapshot.objects) {
+        newIds.insert(obj.objectId);
+        const auto oldIt = oldById.find(obj.objectId);
+        if (oldIt == oldById.end() || !objectRecordEqual(oldIt->second, obj)) {
+          changedOrAdded.push_back(obj);
+        }
+      }
+
+      std::vector<std::string> removedIds;
+      removedIds.reserve(snapshot_.objects.size());
+      for (const auto& oldObj : snapshot_.objects) {
+        if (newIds.find(oldObj.objectId) == newIds.end()) {
+          removedIds.push_back(oldObj.objectId);
+        }
+      }
+
+      std::unordered_map<std::string, viewer3d::domain::LayerRecord> oldLayerById;
+      oldLayerById.reserve(snapshot_.layers.size());
+      for (const auto& layer : snapshot_.layers) {
+        oldLayerById.emplace(layer.layerId, layer);
+      }
+
+      std::unordered_set<std::string> newLayerIds;
+      newLayerIds.reserve(newSnapshot.layers.size());
+      std::vector<viewer3d::domain::LayerRecord> changedOrAddedLayers;
+      changedOrAddedLayers.reserve(newSnapshot.layers.size());
+
+      for (const auto& layer : newSnapshot.layers) {
+        newLayerIds.insert(layer.layerId);
+        const auto oldIt = oldLayerById.find(layer.layerId);
+        if (oldIt == oldLayerById.end() || !layerRecordEqual(oldIt->second, layer)) {
+          changedOrAddedLayers.push_back(layer);
+        }
+      }
+
+      std::vector<std::string> removedLayerIds;
+      removedLayerIds.reserve(snapshot_.layers.size());
+      for (const auto& oldLayer : snapshot_.layers) {
+        if (newLayerIds.find(oldLayer.layerId) == newLayerIds.end()) {
+          removedLayerIds.push_back(oldLayer.layerId);
+        }
+      }
+
+      if (!removedIds.empty()) {
+        backend_->removeObjects(removedIds);
+      }
+      if (!changedOrAdded.empty()) {
+        backend_->updateObjects(changedOrAdded);
+      }
+      if (!removedLayerIds.empty()) {
+        backend_->removeLayers(removedLayerIds);
+      }
+      for (const auto& layer : changedOrAddedLayers) {
+        backend_->updateLayerState(layer);
+      }
+
+      snapshot_ = std::move(newSnapshot);
     }
   }
 
@@ -268,6 +371,9 @@ void OpenRoad3DWindow::refreshView() {
           .arg(snapshot_.objects.size())
           .arg(snapshot_.layers.size())
           .arg(backend_ ? QString::fromStdString(backend_->name()) : "none"));
+
+  // Re-apply current type filters after rebuild to keep UI state and scene state consistent.
+  applyObjectFilters();
 }
 
 void OpenRoad3DWindow::rebuildLayerList() {
@@ -280,6 +386,41 @@ void OpenRoad3DWindow::rebuildLayerList() {
     settings.color = QColor(int(layer.color.r * 255), int(layer.color.g * 255), int(layer.color.b * 255));
     settings.visible = layer.visible;
     settings.selectable = layer.selectable;
+    
+    // Convert LineStyle to Qt::PenStyle for border
+    using viewer3d::domain::LineStyle;
+    switch (layer.lineStyle) {
+      case LineStyle::Solid:
+        settings.borderStyle = Qt::SolidLine;
+        break;
+      case LineStyle::Dashed:
+        settings.borderStyle = Qt::DashLine;
+        break;
+      case LineStyle::Dotted:
+        settings.borderStyle = Qt::DotLine;
+        break;
+      case LineStyle::DashDot:
+        settings.borderStyle = Qt::DashDotLine;
+        break;
+      case LineStyle::DashDotDot:
+        settings.borderStyle = Qt::DashDotDotLine;
+        break;
+      default:
+        settings.borderStyle = Qt::SolidLine;
+    }
+    settings.borderWidth = layer.lineWidth;
+    
+    // Determine fill style from stippleId
+    if (layer.stippleId == "dash") {
+      settings.fillStyle = Qt::Dense3Pattern;  // diagonal hatching
+    } else if (layer.stippleId == "dot") {
+      settings.fillStyle = Qt::Dense5Pattern;  // dots
+    } else if (layer.stippleId == "dashdot" || layer.stippleId == "cross") {
+      settings.fillStyle = Qt::Dense4Pattern;  // dense dots
+    } else {
+      settings.fillStyle = Qt::SolidPattern;
+    }
+    
     layerControl_->addLayer(settings);
   }
 
@@ -332,24 +473,35 @@ void OpenRoad3DWindow::applyObjectFilters() {
     return;
   }
 
-  // Filter objects by type based on checkboxes
+  // Filter objects by type based on checkboxes.
+  // Do not alter geometry fields (e.g., hasBbox) for visibility control.
+  std::vector<viewer3d::domain::ObjectRecord> changedObjects;
+  changedObjects.reserve(snapshot_.objects.size());
   for (auto& obj : snapshot_.objects) {
+    const bool oldVisible = obj.visible;
     switch (obj.type) {
       case viewer3d::domain::ObjectType::Inst:
-        obj.hasBbox = showInstCheck_->isChecked();
+        obj.visible = showInstCheck_->isChecked();
         break;
       case viewer3d::domain::ObjectType::Wire:
-        obj.hasBbox = showWireCheck_->isChecked();
+        obj.visible = showWireCheck_->isChecked();
         break;
       case viewer3d::domain::ObjectType::Via:
-        obj.hasBbox = showViaCheck_->isChecked();
+        obj.visible = showViaCheck_->isChecked();
         break;
       default:
+        obj.visible = true;
         break;
+    }
+
+    if (obj.visible != oldVisible) {
+      changedObjects.push_back(obj);
     }
   }
 
-  backend_->loadScene(snapshot_);
+  if (!changedObjects.empty()) {
+    backend_->updateObjects(changedObjects);
+  }
 }
 
 void OpenRoad3DWindow::setToolMode(viewer3d::render::ToolMode mode) {

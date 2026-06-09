@@ -15,6 +15,33 @@
 namespace gui {
 namespace openroad3d {
 
+///////////////////////// Helper function /////////////////////////////
+
+static QIcon paintLayerIcon(const QColor& color,
+                             Qt::BrushStyle fillStyle,
+                             Qt::PenStyle borderStyle,
+                             float borderWidth)
+{
+  const int iconSize = 24;
+  QPixmap pixmap(iconSize, iconSize);
+  pixmap.fill(Qt::transparent);
+  
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  
+  // Draw filled rectangle with pattern
+  QRect rect(2, 2, iconSize - 4, iconSize - 4);
+  painter.fillRect(rect, QBrush(color, fillStyle));
+  
+  // Draw border with line style and width
+  QPen pen(color, borderWidth);
+  pen.setStyle(borderStyle);
+  painter.setPen(pen);
+  painter.drawRect(rect);
+  
+  return QIcon(pixmap);
+}
+
 ///////////////////////// LayerControlModel /////////////////////////////
 
 LayerControlModel::LayerControlModel(QWidget* parent)
@@ -37,14 +64,20 @@ QVariant LayerControlModel::data(const QModelIndex& index, int role) const {
     return item->checkState();
   }
 
-  if (role == Qt::BackgroundRole && col == Color) {
+  if (role == Qt::DecorationRole && col == Color) {
     QString layerId = item->data(Qt::UserRole + 1).toString();
     if (!layerId.isEmpty()) {
       QStandardItem* nameItem = itemFromIndex(index.sibling(index.row(), Name));
       if (nameItem) {
         QVariant colorVar = nameItem->data(Qt::UserRole + 2);
         if (colorVar.isValid()) {
-          return QBrush(colorVar.value<QColor>());
+          QColor color = colorVar.value<QColor>();
+          Qt::BrushStyle fillStyle = static_cast<Qt::BrushStyle>(
+              nameItem->data(Qt::UserRole + 3).toInt());
+          Qt::PenStyle borderStyle = static_cast<Qt::PenStyle>(
+              nameItem->data(Qt::UserRole + 4).toInt());
+          float borderWidth = nameItem->data(Qt::UserRole + 5).toFloat();
+          return paintLayerIcon(color, fillStyle, borderStyle, borderWidth);
         }
       }
     }
@@ -153,12 +186,14 @@ void LayerControl::addLayer(const LayerSettings& layer) {
   auto* nameItem = new QStandardItem(QString::fromStdString(layer.name));
   nameItem->setData(layerId, Qt::UserRole + 1);
   nameItem->setData(QVariant::fromValue(layer.color), Qt::UserRole + 2);
+  nameItem->setData(static_cast<int>(layer.fillStyle), Qt::UserRole + 3);
+  nameItem->setData(static_cast<int>(layer.borderStyle), Qt::UserRole + 4);
+  nameItem->setData(layer.borderWidth, Qt::UserRole + 5);
   nameItem->setEditable(false);
   row.append(nameItem);
 
-  // Color item (shows as swatch)
+  // Color item (shows as swatch - will be painted dynamically)
   auto* colorItem = new QStandardItem();
-  colorItem->setData(QVariant::fromValue(layer.color), Qt::DecorationRole);
   colorItem->setData(layerId, Qt::UserRole + 1);
   colorItem->setEditable(false);
   row.append(colorItem);
@@ -192,12 +227,11 @@ void LayerControl::updateLayerInModel(const LayerSettings& layer) {
   for (int row = 0; row < model_->rowCount(); ++row) {
     QStandardItem* nameItem = model_->item(row, LayerControlModel::Name);
     if (nameItem && nameItem->data(Qt::UserRole + 1).toString() == layerId) {
-      // Update color
-      QStandardItem* colorItem = model_->item(row, LayerControlModel::Color);
-      if (colorItem) {
-        colorItem->setData(QVariant::fromValue(layer.color), Qt::DecorationRole);
-        nameItem->setData(QVariant::fromValue(layer.color), Qt::UserRole + 2);
-      }
+      // Update color and style
+      nameItem->setData(QVariant::fromValue(layer.color), Qt::UserRole + 2);
+      nameItem->setData(static_cast<int>(layer.fillStyle), Qt::UserRole + 3);
+      nameItem->setData(static_cast<int>(layer.borderStyle), Qt::UserRole + 4);
+      nameItem->setData(layer.borderWidth, Qt::UserRole + 5);
       
       // Update visible
       QStandardItem* visibleItem = model_->item(row, LayerControlModel::Visible);
