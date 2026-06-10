@@ -71,6 +71,7 @@ class OpenRoad3DWindow : public QMainWindow {
   QCheckBox* showInstCheck_;
   QCheckBox* showWireCheck_;
   QCheckBox* showViaCheck_;
+  QCheckBox* showNamesCheck_;
 
   // Tool buttons
   QPushButton* navigateButton_;
@@ -89,6 +90,7 @@ class OpenRoad3DWindow : public QMainWindow {
   // Backend
   std::unique_ptr<viewer3d::render::IRenderBackend> backend_;
   viewer3d::domain::SceneSnapshot snapshot_;
+  bool sceneLoaded_ = false;
   viewer3d::render::ToolMode currentToolMode_;
   QString lastViewActionLabel_;
 };

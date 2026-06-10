@@ -7,6 +7,8 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <QColor>
 #include <QImage>
@@ -188,6 +190,31 @@ const domain::ObjectRecord* findObjectRecord(const domain::SceneSnapshot& snapsh
   return nullptr;
 }
 
+const char* objectTypeText(domain::ObjectType type) {
+  switch (type) {
+    case domain::ObjectType::Wire:
+      return "wire";
+    case domain::ObjectType::Via:
+      return "via";
+    case domain::ObjectType::Inst:
+      return "inst";
+    case domain::ObjectType::Pin:
+      return "pin";
+    case domain::ObjectType::Drc:
+      return "drc";
+    case domain::ObjectType::Blockage:
+      return "blockage";
+    case domain::ObjectType::Track:
+      return "track";
+    case domain::ObjectType::Bump:
+      return "bump";
+    case domain::ObjectType::Text:
+      return "text";
+    default:
+      return "unknown";
+  }
+}
+
 std::array<osg::Vec3, 8> objectCorners(const domain::ObjectRecord& object,
                                        const domain::LayerRecord* layer) {
   const float zBase = layer ? layer->zBase : 0.0F;
@@ -367,6 +394,117 @@ void OsgBackend::updateLayerState(const domain::LayerRecord& layer) {
   requestRedraw();
 }
 
+void OsgBackend::updateObjects(const std::vector<domain::ObjectRecord>& objects) {
+  if (objects.empty()) {
+    return;
+  }
+
+  auto equalExceptVisible = [](const domain::ObjectRecord& a,
+                               const domain::ObjectRecord& b) {
+    return a.objectId == b.objectId && a.type == b.type && a.layerId == b.layerId
+           && a.groupId == b.groupId && a.transform == b.transform
+           && a.bboxMin == b.bboxMin && a.bboxMax == b.bboxMax
+           && a.hasBbox == b.hasBbox && a.geometryRef == b.geometryRef
+           && a.styleRef == b.styleRef && a.displayName == b.displayName;
+  };
+
+  std::unordered_map<std::string, std::size_t> objectIndexById;
+  objectIndexById.reserve(snapshot_.objects.size());
+  for (std::size_t index = 0; index < snapshot_.objects.size(); ++index) {
+    objectIndexById[snapshot_.objects[index].objectId] = index;
+  }
+
+  std::vector<domain::ObjectRecord> fullUpdates;
+  fullUpdates.reserve(objects.size());
+  std::vector<std::pair<std::string, bool>> visibilityOnlyUpdates;
+  visibilityOnlyUpdates.reserve(objects.size());
+
+  for (const auto& object : objects) {
+    auto found = objectIndexById.find(object.objectId);
+    if (found == objectIndexById.end()) {
+      snapshot_.objects.push_back(object);
+      objectIndexById[object.objectId] = snapshot_.objects.size() - 1;
+      fullUpdates.push_back(object);
+    } else {
+      auto& existing = snapshot_.objects[found->second];
+      if (existing.visible != object.visible && equalExceptVisible(existing, object)) {
+        existing.visible = object.visible;
+        visibilityOnlyUpdates.emplace_back(object.objectId, object.visible);
+      } else {
+        existing = object;
+        fullUpdates.push_back(object);
+      }
+    }
+  }
+
+  if (scene_) {
+    if (!fullUpdates.empty()) {
+      scene_->upsertObjects(fullUpdates);
+    }
+    if (!visibilityOnlyUpdates.empty()) {
+      scene_->updateObjectVisibility(visibilityOnlyUpdates);
+    }
+  }
+  requestRedraw();
+}
+
+void OsgBackend::removeObjects(const std::vector<std::string>& objectIds) {
+  if (objectIds.empty()) {
+    return;
+  }
+
+  std::unordered_set<std::string> idSet;
+  idSet.reserve(objectIds.size());
+  for (const auto& id : objectIds) {
+    idSet.insert(id);
+  }
+
+  snapshot_.objects.erase(
+      std::remove_if(snapshot_.objects.begin(),
+                     snapshot_.objects.end(),
+                     [&](const domain::ObjectRecord& object) {
+                       return idSet.find(object.objectId) != idSet.end();
+                     }),
+      snapshot_.objects.end());
+
+  if (scene_) {
+    scene_->removeObjectsById(objectIds);
+  }
+
+  if (!selectedObjectId_.empty() && idSet.find(selectedObjectId_) != idSet.end()) {
+    clearSelection();
+    return;
+  }
+
+  requestRedraw();
+}
+
+void OsgBackend::removeLayers(const std::vector<std::string>& layerIds) {
+  if (layerIds.empty()) {
+    return;
+  }
+
+  std::unordered_set<std::string> idSet;
+  idSet.reserve(layerIds.size());
+  for (const auto& id : layerIds) {
+    idSet.insert(id);
+  }
+
+  snapshot_.layers.erase(
+      std::remove_if(snapshot_.layers.begin(),
+                     snapshot_.layers.end(),
+                     [&](const domain::LayerRecord& layer) {
+                       return idSet.find(layer.layerId) != idSet.end();
+                     }),
+      snapshot_.layers.end());
+
+  if (scene_) {
+    scene_->removeLayersById(layerIds);
+  }
+
+  requestRedraw();
+}
+
 void OsgBackend::clearScene() {
   snapshot_ = domain::SceneSnapshot{};
   if (scene_) {
@@ -498,6 +636,19 @@ bool OsgBackend::saveScreenshot(const std::string& filePath) {
   }
   const QImage image = viewWidget_->grab().toImage();
   return !image.isNull() && image.save(QString::fromStdString(filePath));
+}
+
+void OsgBackend::setDisplayNamesVisible(bool visible) {
+  if (scene_) {
+    scene_->setDisplayNamesVisible(visible);
+  }
+}
+
+bool OsgBackend::isDisplayNamesVisible() const {
+  if (scene_) {
+    return scene_->isDisplayNamesVisible();
+  }
+  return false;
 }
 
 void OsgBackend::createSceneGraph() {
@@ -902,11 +1053,24 @@ void OsgBackend::drawOverlay(QPainter& painter, const QSize& size) const {
                    QString::fromStdString(status.str()));
 
   if (!selectedObjectId_.empty()) {
+    std::string selectionText = selectedObjectId_;
+    if (const domain::ObjectRecord* selected = findObjectRecord(snapshot_, selectedObjectId_)) {
+      std::string name = selected->displayName;
+      if (name.empty() &&
+          (selected->type == domain::ObjectType::Wire || selected->type == domain::ObjectType::Via)) {
+        name = selected->groupId;
+      }
+      if (name.empty()) {
+        name = selectedObjectId_;
+      }
+      selectionText = std::string(objectTypeText(selected->type)) + ":" + name;
+    }
+
     painter.setPen(QPen(QColor(220, 245, 255, 230), 1.5));
     painter.setBrush(QColor(8, 24, 40, 165));
     painter.drawRoundedRect(QRectF(10.0, 10.0, 380.0, 28.0), 6.0, 6.0);
     painter.drawText(QRectF(18.0, 10.0, 364.0, 28.0), Qt::AlignVCenter | Qt::AlignLeft,
-                     QString::fromStdString("selected: " + selectedObjectId_));
+                     QString::fromStdString("selected: " + selectionText));
   }
 
   if (rulerHasStart_) {

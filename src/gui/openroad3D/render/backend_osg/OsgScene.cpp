@@ -1,14 +1,19 @@
 #include "OsgScene.h"
+#include "OsgFontAtlas.h"
 #include "OsgGeometry.h"
 #include "OsgLight.h"
 #include "OsgMaterial.h"
+#include "OsgTextGeode.h"
 #include "OsgTexture.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <osg/MatrixTransform>
@@ -26,6 +31,9 @@
 #include <osg/PolygonMode>
 #include <osg/ShadeModel>
 #include <osg/LineStipple>
+#include <osg/CullFace>
+#include <osg/LOD>
+#include <osg/PolygonOffset>
 #include <osgDB/ReaderWriter>
 #include <osgDB/ReadFile>
 #include <osgUtil/IntersectVisitor>
@@ -39,6 +47,49 @@ namespace render {
 namespace backend_osg {
 
 namespace {
+
+struct LocalBoxParams {
+    float width = 1.0F;
+    float height = 1.0F;
+    float depth = 0.3F;
+    float xOffset = 0.0F;
+    float yOffset = 0.0F;
+};
+
+LocalBoxParams computeLocalBoxParamsFromBbox(const domain::ObjectRecord& obj,
+                                             float defaultDepth,
+                                             float minDepth = 0.01F,
+                                             bool offsetFromTransform = true) {
+    LocalBoxParams params;
+    params.depth = defaultDepth;
+
+    if (!obj.hasBbox) {
+        return params;
+    }
+
+    params.width = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
+    params.height = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
+    params.depth = std::max(minDepth, obj.bboxMax[2] - obj.bboxMin[2]);
+    if (offsetFromTransform) {
+        params.xOffset = obj.bboxMin[0] - obj.transform[12];
+        params.yOffset = obj.bboxMin[1] - obj.transform[13];
+    } else {
+        params.xOffset = obj.bboxMin[0];
+        params.yOffset = obj.bboxMin[1];
+    }
+    return params;
+}
+
+bool isDebugLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* value = std::getenv("OPENROAD_3D_DEBUG");
+        if (!value) {
+            return false;
+        }
+        return value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 std::vector<osg::Vec2> parsePolylinePoints(const std::string& geometryRef) {
     std::vector<osg::Vec2> points;
@@ -247,13 +298,44 @@ bool OsgSceneObject::isHighlighted() const {
 OsgScene::OsgScene() : osg::Object(true) {
     objectRoot_ = new osg::Group();
     objectRoot_->setName("SceneObjects");
-    
+
     highlightRoot_ = new osg::Switch();
     highlightRoot_->setName("HighlightObjects");
+
+    // Initialize font atlas for name labels (stb_truetype, glview-style)
+    initFontAtlas();
 }
 
 OsgScene::~OsgScene() {
     clear();
+}
+
+bool OsgScene::initFontAtlas() {
+    fontAtlas_ = std::make_unique<OsgFontAtlas>();
+
+    // Try common system font paths
+    static const char* fontPaths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+        nullptr  // sentinel
+    };
+
+    for (const char** path = fontPaths; *path; ++path) {
+        std::ifstream probe(*path, std::ios::binary);
+        if (probe.good()) {
+            probe.close();
+            if (fontAtlas_->initFont(*path)) {
+                fprintf(stderr, "DEBUG: Loaded font: %s\n", *path);
+                return true;
+            }
+        }
+    }
+
+    fprintf(stderr, "WARNING: No font found for text labels\n");
+    return false;
 }
 
 osg::Object* OsgScene::cloneType() const {
@@ -296,20 +378,23 @@ void OsgScene::addObject(ISceneObject* object) {
 
 void OsgScene::removeObject(ISceneObject* object) {
     if (!object) return;
-    
+
     OsgSceneObject* osgObj = dynamic_cast<OsgSceneObject*>(object);
     if (!osgObj) return;
-    
+
     osg::Node* node = osgObj->getOsgNode();
     if (node) {
         objectRoot_->removeChild(node);
         objects_.erase(std::remove(objects_.begin(), objects_.end(), node), objects_.end());
-        auto byId = objectsById_.find(object->getId());
+
+        // Capture ID before deleting (delete invalidates the `object` pointer)
+        const std::string id = object->getId();
+        auto byId = objectsById_.find(id);
         if (byId != objectsById_.end()) {
             delete byId->second;
             objectsById_.erase(byId);
         }
-        objectLayerById_.erase(object->getId());
+        objectLayerById_.erase(id);
     }
 }
 
@@ -322,7 +407,13 @@ void OsgScene::clear() {
     objects_.clear();
     objectsById_.clear();
     objectLayerById_.clear();
+    layers_.clear();
     highlightNodes_.clear();
+    previousSelectedId_.clear();
+    
+    // Clear name label state
+    textLabelNodes_.clear();
+    objectRecordsById_.clear();
 }
 
 size_t OsgScene::getObjectCount() const {
@@ -438,8 +529,15 @@ void OsgScene::getBoundingBox(Vec3& min, Vec3& max) const {
     for (auto& node : objects_) {
         osg::BoundingSphere bs = node->getBound();
         bbox.expandBy(bs);
-        fprintf(stderr, "DEBUG getBoundingBox: node=%s bound_center=(%f,%f,%f) radius=%f\n",
-                node->getName().c_str(), bs.center().x(), bs.center().y(), bs.center().z(), bs.radius());
+        if (isDebugLoggingEnabled()) {
+            fprintf(stderr,
+                    "DEBUG getBoundingBox: node=%s bound_center=(%f,%f,%f) radius=%f\n",
+                    node->getName().c_str(),
+                    bs.center().x(),
+                    bs.center().y(),
+                    bs.center().z(),
+                    bs.radius());
+        }
     }
     
     min = Vec3{bbox.xMin(), bbox.yMin(), bbox.zMin()};
@@ -461,6 +559,102 @@ void OsgScene::loadSnapshot(const domain::SceneSnapshot& snapshot) {
         if (sceneObj) {
             addObject(sceneObj);
         }
+    }
+}
+
+void OsgScene::upsertObjects(const std::vector<domain::ObjectRecord>& objects) {
+    for (const auto& obj : objects) {
+        auto existing = objectsById_.find(obj.objectId);
+        if (existing != objectsById_.end()) {
+            OsgSceneObject* existingObj = existing->second;
+            osg::Node* node = existingObj ? existingObj->getOsgNode() : nullptr;
+            if (node) {
+                objectRoot_->removeChild(node);
+                objects_.erase(std::remove(objects_.begin(), objects_.end(), node), objects_.end());
+            }
+            delete existingObj;
+            objectsById_.erase(existing);
+            objectLayerById_.erase(obj.objectId);
+        }
+
+        const domain::LayerRecord* layer = getLayer(obj.layerId);
+        OsgSceneObject* sceneObj = createSceneObject(obj, layer);
+        if (sceneObj) {
+            addObject(sceneObj);
+        }
+    }
+}
+
+void OsgScene::updateObjectVisibility(
+    const std::vector<std::pair<std::string, bool>>& visibilityUpdates) {
+    for (const auto& entry : visibilityUpdates) {
+        const std::string& objectId = entry.first;
+        const bool visible = entry.second;
+        auto found = objectsById_.find(objectId);
+        if (found != objectsById_.end() && found->second) {
+            found->second->setVisible(visible);
+        }
+    }
+}
+
+void OsgScene::removeObjectsById(const std::vector<std::string>& objectIds) {
+    if (objectIds.empty()) {
+        return;
+    }
+
+    std::unordered_set<std::string> idSet;
+    idSet.reserve(objectIds.size());
+    for (const auto& id : objectIds) {
+        idSet.insert(id);
+    }
+
+    for (const auto& id : objectIds) {
+        auto existing = objectsById_.find(id);
+        if (existing == objectsById_.end()) {
+            continue;
+        }
+
+        OsgSceneObject* existingObj = existing->second;
+        osg::Node* node = existingObj ? existingObj->getOsgNode() : nullptr;
+        if (node) {
+            objectRoot_->removeChild(node);
+            objects_.erase(std::remove(objects_.begin(), objects_.end(), node), objects_.end());
+        }
+
+        auto highlight = highlightNodes_.find(id);
+        if (highlight != highlightNodes_.end()) {
+            osg::Node* highlightNode = highlight->second.get();
+            if (highlightNode) {
+                osg::Group* parent = highlightNode->getParent(0);
+                if (parent) {
+                    parent->removeChild(highlightNode);
+                }
+                highlightRoot_->removeChild(highlightNode);
+            }
+            highlightNodes_.erase(highlight);
+        }
+
+        delete existingObj;
+        objectsById_.erase(existing);
+        objectLayerById_.erase(id);
+
+        if (previousSelectedId_ == id) {
+            previousSelectedId_.clear();
+        }
+        
+        // Clean up name label state
+        textLabelNodes_.erase(id);
+        objectRecordsById_.erase(id);
+    }
+}
+
+void OsgScene::removeLayersById(const std::vector<std::string>& layerIds) {
+    if (layerIds.empty()) {
+        return;
+    }
+
+    for (const auto& layerId : layerIds) {
+        layers_.erase(layerId);
     }
 }
 
@@ -548,24 +742,55 @@ OsgSceneObject* OsgScene::createSceneObject(const domain::ObjectRecord& obj, con
     osg::MatrixTransform* transform = new osg::MatrixTransform();
     transform->setName(obj.objectId);
     
-    // Debug output for transform (show first 5 wire objects)
-    static int wireDebugCount = 0;
-    if (obj.objectId.find("wire_") == 0 && wireDebugCount < 5) {
-        fprintf(stderr, "DEBUG createSceneObject: %s hasBbox=%d layerId=%s transform=(%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f)\n",
-                obj.objectId.c_str(), obj.hasBbox, obj.layerId.c_str(),
-                obj.transform[0], obj.transform[1], obj.transform[2], obj.transform[3],
-                obj.transform[4], obj.transform[5], obj.transform[6], obj.transform[7],
-                obj.transform[8], obj.transform[9], obj.transform[10], obj.transform[11],
-                obj.transform[12], obj.transform[13], obj.transform[14], obj.transform[15]);
-        wireDebugCount++;
-    }
-    if (obj.objectId.find("debug_") == 0) {
-        fprintf(stderr, "DEBUG createSceneObject: %s hasBbox=%d transform=(%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f)\n",
-                obj.objectId.c_str(), obj.hasBbox,
-                obj.transform[0], obj.transform[1], obj.transform[2], obj.transform[3],
-                obj.transform[4], obj.transform[5], obj.transform[6], obj.transform[7],
-                obj.transform[8], obj.transform[9], obj.transform[10], obj.transform[11],
-                obj.transform[12], obj.transform[13], obj.transform[14], obj.transform[15]);
+    if (isDebugLoggingEnabled()) {
+        // Debug output for transform (show first 5 wire objects)
+        static int wireDebugCount = 0;
+        if (obj.objectId.find("wire_") == 0 && wireDebugCount < 5) {
+            fprintf(stderr,
+                    "DEBUG createSceneObject: %s hasBbox=%d layerId=%s transform=(%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f)\n",
+                    obj.objectId.c_str(),
+                    obj.hasBbox,
+                    obj.layerId.c_str(),
+                    obj.transform[0],
+                    obj.transform[1],
+                    obj.transform[2],
+                    obj.transform[3],
+                    obj.transform[4],
+                    obj.transform[5],
+                    obj.transform[6],
+                    obj.transform[7],
+                    obj.transform[8],
+                    obj.transform[9],
+                    obj.transform[10],
+                    obj.transform[11],
+                    obj.transform[12],
+                    obj.transform[13],
+                    obj.transform[14],
+                    obj.transform[15]);
+            wireDebugCount++;
+        }
+        if (obj.objectId.find("debug_") == 0) {
+            fprintf(stderr,
+                    "DEBUG createSceneObject: %s hasBbox=%d transform=(%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f)\n",
+                    obj.objectId.c_str(),
+                    obj.hasBbox,
+                    obj.transform[0],
+                    obj.transform[1],
+                    obj.transform[2],
+                    obj.transform[3],
+                    obj.transform[4],
+                    obj.transform[5],
+                    obj.transform[6],
+                    obj.transform[7],
+                    obj.transform[8],
+                    obj.transform[9],
+                    obj.transform[10],
+                    obj.transform[11],
+                    obj.transform[12],
+                    obj.transform[13],
+                    obj.transform[14],
+                    obj.transform[15]);
+        }
     }
     
     // English comment.
@@ -579,7 +804,7 @@ OsgSceneObject* OsgScene::createSceneObject(const domain::ObjectRecord& obj, con
     transform->setMatrix(mat);
     
     // Debug: check the matrix that was set
-    if (obj.objectId.find("debug_") == 0) {
+    if (isDebugLoggingEnabled() && obj.objectId.find("debug_") == 0) {
         osg::Vec3d t = mat.getTrans();
         fprintf(stderr, "DEBUG createSceneObject: %s matrix translation=(%f,%f,%f)\n",
                 obj.objectId.c_str(), t.x(), t.y(), t.z());
@@ -593,20 +818,428 @@ OsgSceneObject* OsgScene::createSceneObject(const domain::ObjectRecord& obj, con
     geode->setName(obj.objectId + ":geode");
     
 
-    sceneObj->setVisible(!layer || layer->visible);
+    sceneObj->setVisible((!layer || layer->visible) && obj.visible);
     sceneObj->setSelectable(!layer || layer->selectable);
-       switch (obj.type) {
-        case domain::ObjectType::Inst: {
-            float width = 1.0F, height = 1.0F, depth = 0.3F;
-            float xOffset = 0.0F, yOffset = 0.0F;
-            if (obj.hasBbox) {
-                width = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
-                height = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
-                depth = std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2]);
-                xOffset = obj.bboxMin[0] - obj.transform[12];
-                yOffset = obj.bboxMin[1] - obj.transform[13];
+    attachObjectGeometry(geode, obj, layer);
+    
+    // English comment.
+    if (layer) {
+        configureGeodeRenderState(geode, *layer, obj.type);
+    }
+    
+    transform->addChild(geode);
+    
+    // Store object record for label recreation
+    objectRecordsById_[obj.objectId] = obj;
+    
+    // Attach name labels if display is enabled
+    if (displayNamesVisible_ && !obj.displayName.empty()) {
+        attachObjectLabels(transform, obj, layer);
+    }
+    
+    return sceneObj;
+}
+
+void OsgScene::setDisplayNamesVisible(bool visible) {
+    fprintf(stderr, "DEBUG setDisplayNamesVisible: visible=%d displayNamesVisible_ was %d\n", visible, displayNamesVisible_);
+    if (displayNamesVisible_ == visible) {
+        return;
+    }
+    displayNamesVisible_ = visible;
+    
+    if (visible) {
+        // Rebuild labels for all existing objects
+        fprintf(stderr, "DEBUG setDisplayNamesVisible: rebuilding labels for %zu objects\n", objectRecordsById_.size());
+        for (const auto& pair : objectRecordsById_) {
+            const std::string& objectId = pair.first;
+            const domain::ObjectRecord& obj = pair.second;
+            auto objIt = objectsById_.find(objectId);
+            if (objIt == objectsById_.end()) {
+                continue;
             }
-            osg::Geometry* geom = createBoxGeometry(xOffset, yOffset, width, height, depth);
+            OsgSceneObject* sceneObj = objIt->second;
+            if (!sceneObj) {
+                continue;
+            }
+            osg::MatrixTransform* transform = sceneObj->getOsgNode();
+            if (!transform) {
+                continue;
+            }
+            auto layerIt = layers_.find(obj.layerId);
+            const domain::LayerRecord* layer = (layerIt != layers_.end()) ? &layerIt->second : nullptr;
+            attachObjectLabels(transform, obj, layer);
+        }
+    } else {
+        // Remove all label nodes
+        for (auto& pair : textLabelNodes_) {
+            osg::Group* labelGroup = pair.second.get();
+            if (labelGroup) {
+                osg::Group* parent = labelGroup->getParent(0);
+                if (parent) {
+                    parent->removeChild(labelGroup);
+                }
+            }
+        }
+        textLabelNodes_.clear();
+    }
+}
+
+void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
+                                  const domain::ObjectRecord& obj,
+                                  const domain::LayerRecord* layer) {
+    if (!transform || obj.displayName.empty()) {
+        return;
+    }
+    
+    // DEBUG: Show all objects being processed
+    static int objDebugCount = 0;
+    if (objDebugCount < 10) {
+        fprintf(stderr, "DEBUG attach: name=%s displayName=%s type=%d hasBbox=%d displayNamesVisible_=%d\n",
+                obj.objectId.c_str(), obj.displayName.c_str(), (int)obj.type, obj.hasBbox, displayNamesVisible_);
+        objDebugCount++;
+    }
+    
+    // Remove existing labels for this object
+    removeObjectLabels(obj.objectId);
+    
+    // Compute bbox dimensions
+    float xlen = 1.0F;
+    float ylen = 1.0F;
+    float zlen = 0.3F;
+    if (obj.hasBbox) {
+        xlen = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
+        ylen = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
+        zlen = std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2]);
+    }
+
+    // Skip labels for tiny objects (charSize would be too small to read or
+    // would require a disproportionately large minimum that dwarfs the object).
+    float minDim = std::min({xlen, ylen, zlen});
+    if (minDim < 0.05F) {
+        return;
+    }
+
+    // Text color: always white now that we have a dark background halo for contrast.
+    // (The old brightness-based white/black switch was needed without a halo;
+    //  with the halo, white text is readable on any surface.)
+    osg::Vec4 textColor(1.0F, 1.0F, 1.0F, 1.0F);
+
+    // Character size: use the middle dimension to avoid extremes.
+    // For pins/vias, the bbox can be very large in one direction (extends along wire).
+    // For normal objects, we scale with maxDim but cap to prevent giants.
+    float maxDim = std::max({xlen, ylen, zlen});
+    float midDim;
+    if (obj.type == domain::ObjectType::Pin || obj.type == domain::ObjectType::Via) {
+        // For pins and vias, use the smallest dimension (thickness) as reference
+        // to avoid oversized labels for elongated bbox
+        midDim = minDim;
+    } else {
+        midDim = maxDim;
+    }
+    // Use glview-style scaling: text should be ~0.16 world units (40px * 0.004 scale)
+    // This gives approximately 4% of object dimension vs 20% before
+    float charSize = midDim * 0.04F;
+    
+    // Ensure text is readable with minimum size floor (glview default scale)
+    charSize = std::max(0.16F, charSize);
+    // Cap to prevent too large labels
+    charSize = std::min(1.0F, charSize);
+    
+    // For pins/vias with long names, further constrain charSize to fit text on small faces
+    if (obj.type == domain::ObjectType::Pin || obj.type == domain::ObjectType::Via) {
+        // Approximate text width: ~24 world units per char at FONT_SIZE=40
+        // Text should fit within the smallest face dimension
+        float approxTextWidth = static_cast<float>(obj.displayName.length()) * 24.0F * (charSize / 40.0F);
+        float maxTextWidth = minDim * 0.8F;  // Text shouldn't exceed 80% of smallest dimension
+        if (approxTextWidth > maxTextWidth) {
+            charSize = charSize * maxTextWidth / approxTextWidth;
+            charSize = std::max(0.05F, charSize);  // Hard floor for visibility
+        }
+    }
+    
+    // DEBUG: Log label info for first few objects
+    static int labelDebugCount = 0;
+    if (labelDebugCount < 20 && obj.displayName.length() > 0) {
+        fprintf(stderr, "DEBUG label: name=%s type=%d xlen=%.3f ylen=%.3f zlen=%.3f minDim=%.3f maxDim=%.3f midDim=%.3f charSize=%.3f frontZ=%.3f\n",
+                obj.displayName.c_str(), (int)obj.type, xlen, ylen, zlen, minDim, maxDim, midDim, charSize,
+                zlen * 0.5F + charSize * 0.02F);
+        labelDebugCount++;
+    }
+    
+    // Create label group
+    osg::Group* labelGroup = new osg::Group();
+    labelGroup->setName(obj.objectId + ":labels");
+    
+    // Determine if object is wire-like (one dimension dominates)
+    float dimRatio = maxDim / std::max(0.01F, minDim);
+    bool isWireLike = (dimRatio > 10.0F);
+    
+    // Face selection: 
+    // For normal objects: 2 pairs of faces (4 faces total)
+    // For wire-like objects: only top face (1 face) to avoid clutter
+    bool needFrontBack = !isWireLike;
+    bool needTopBottom = !isWireLike;
+    bool needRightLeft = false;
+    
+    if (isWireLike) {
+        // Wire-like: show on top face only
+        needTopBottom = true;
+    } else if (ylen > xlen && ylen > zlen) {
+        // Long in vertical - use front/back + right/left
+        needFrontBack = true;
+        needRightLeft = true;
+    } else if (zlen > ylen && zlen > xlen) {
+        // Long in depth - use top/bottom + right/left
+        needTopBottom = true;
+        needRightLeft = true;
+    } else {
+        // Long in X or cube - use front/back + top/bottom
+        needFrontBack = true;
+        needTopBottom = true;
+    }
+    
+    // Center point in LOCAL coordinates (labelGroup is under object transform)
+    // Geometry is positioned at (xOffset, yOffset, zBase) where:
+    // xOffset = bboxMin[0] - transform[12]
+    // yOffset = bboxMin[1] - transform[13]
+    // So bboxMin in LOCAL coords is (bboxMin[0] - transform[12], bboxMin[1] - transform[13], bboxMin[2])
+    // and bbox center in LOCAL coords is ((bboxMax[0]+bboxMin[0])/2 - transform[12], ...)
+    float centerX = 0.0F;
+    float centerY = 0.0F;
+    float centerZ = 0.0F;
+    
+    if (obj.hasBbox) {
+        centerX = (obj.bboxMax[0] + obj.bboxMin[0]) * 0.5F - obj.transform[12];
+        centerY = (obj.bboxMax[1] + obj.bboxMin[1]) * 0.5F - obj.transform[13];
+        centerZ = (obj.bboxMax[2] + obj.bboxMin[2]) * 0.5F - obj.transform[14];
+    }
+    
+    float offset = charSize * 0.02F;  // Small offset proportional to text size
+    
+    // Surface positions in LOCAL coordinates where geometry is at bboxMin
+    // front face: bboxMax[2] - transform[14] + offset
+    // back face: bboxMin[2] - transform[14] - offset  
+    // top face: bboxMax[1] - transform[13] + offset
+    // bottom face: bboxMin[1] - transform[13] - offset
+    // right face: bboxMax[0] - transform[12] + offset
+    // left face: bboxMin[0] - transform[12] - offset
+    float frontZ = (obj.hasBbox ? obj.bboxMax[2] : zlen) - obj.transform[14] + offset;
+    float backZ = (obj.hasBbox ? obj.bboxMin[2] : -zlen) - obj.transform[14] - offset;
+    float topY = (obj.hasBbox ? obj.bboxMax[1] : ylen) - obj.transform[13] + offset;
+    float bottomY = (obj.hasBbox ? obj.bboxMin[1] : -ylen) - obj.transform[13] - offset;
+    float rightX = (obj.hasBbox ? obj.bboxMax[0] : xlen) - obj.transform[12] + offset;
+    float leftX = (obj.hasBbox ? obj.bboxMin[0] : -xlen) - obj.transform[12] - offset;
+    
+    // Add text on selected faces with correct rotation
+    if (needFrontBack) {
+        osg::Quat frontRot = computeFaceRotation(LabelFace::Front, xlen, ylen, zlen);
+        osg::Quat backRot = computeFaceRotation(LabelFace::Back, xlen, ylen, zlen);
+
+        // Front face (top Z surface)
+        osg::Node* frontLabel = makeTextGeodeForFace(obj.displayName, centerX, centerY, frontZ, charSize, textColor, frontRot);
+        if (frontLabel) {
+            labelGroup->addChild(frontLabel);
+        }
+        // Back face
+        osg::Node* backLabel = makeTextGeodeForFace(obj.displayName, centerX, centerY, backZ, charSize, textColor, backRot);
+        if (backLabel) {
+            labelGroup->addChild(backLabel);
+        }
+    }
+
+    if (needTopBottom) {
+        osg::Quat topRot = computeFaceRotation(LabelFace::Top, xlen, ylen, zlen);
+        osg::Quat bottomRot = computeFaceRotation(LabelFace::Bottom, xlen, ylen, zlen);
+
+        // DEBUG: Log charSize before calling makeTextGeodeForFace
+        fprintf(stderr, "DEBUG preTopFace: name=%s charSize=%.3f topY=%.3f centerZ=%.3f\n",
+                obj.displayName.c_str(), charSize, topY, centerZ);
+
+        // Top face (top Y surface)
+        osg::Node* topLabel = makeTextGeodeForFace(obj.displayName, centerX, topY, centerZ, charSize, textColor, topRot);
+        if (topLabel) {
+            labelGroup->addChild(topLabel);
+        }
+        // Bottom face
+        osg::Node* bottomLabel = makeTextGeodeForFace(obj.displayName, centerX, bottomY, centerZ, charSize, textColor, bottomRot);
+        if (bottomLabel) {
+            labelGroup->addChild(bottomLabel);
+        }
+    }
+
+    if (needRightLeft) {
+        osg::Quat rightRot = computeFaceRotation(LabelFace::Right, xlen, ylen, zlen);
+        osg::Quat leftRot = computeFaceRotation(LabelFace::Left, xlen, ylen, zlen);
+
+        // Right face (right X surface)
+        osg::Node* rightLabel = makeTextGeodeForFace(obj.displayName, rightX, centerY, centerZ, charSize, textColor, rightRot);
+        if (rightLabel) {
+            labelGroup->addChild(rightLabel);
+        }
+        // Left face
+        osg::Node* leftLabel = makeTextGeodeForFace(obj.displayName, leftX, centerY, centerZ, charSize, textColor, leftRot);
+        if (leftLabel) {
+            labelGroup->addChild(leftLabel);
+        }
+    }
+    
+    // Wrap labels in LOD so they only appear within a distance proportional to
+    // the object's longest dimension. Small objects disappear sooner, large
+    // objects (instances) keep labels visible from farther away.
+    float lodDistance = maxDim * 20.0F;
+    lodDistance = std::max(5.0F, lodDistance);
+
+    osg::LOD* lod = new osg::LOD();
+    lod->setName(obj.objectId + ":labels");
+    lod->setCenter(osg::Vec3(centerX, centerY, centerZ));
+    lod->addChild(labelGroup, 0.0F, lodDistance);
+
+    transform->addChild(lod);
+    textLabelNodes_[obj.objectId] = lod;
+}
+
+osg::Quat OsgScene::computeFaceRotation(LabelFace face,
+                                         float xlen,
+                                         float ylen,
+                                         float zlen) const {
+    // Text geometry is in the XY plane at the origin, facing +Z.
+    //
+    // Base rotation: makes the text face the correct cube face.
+    // Readability rotation: when an object is taller in one axis, rotate
+    // the text so it remains readable (matches glview behavior).
+
+    // Base rotation: which face to point at
+    osg::Quat base;
+    switch (face) {
+        case LabelFace::Front:                                 break; // faces +Z
+        case LabelFace::Back:  base = osg::Quat(osg::PI,       osg::Vec3(0,1,0)); break; // faces -Z
+        case LabelFace::Right: base = osg::Quat(osg::PI_2,     osg::Vec3(0,1,0)); break; // faces +X
+        case LabelFace::Left:  base = osg::Quat(-osg::PI_2,    osg::Vec3(0,1,0)); break; // faces -X
+        case LabelFace::Top:   base = osg::Quat(-osg::PI_2,    osg::Vec3(1,0,0)); break; // faces +Y
+        case LabelFace::Bottom:base = osg::Quat(osg::PI_2,     osg::Vec3(1,0,0)); break; // faces -Y
+    }
+
+    // Readability rotation: applied after base, rotates text in the face plane
+    osg::Quat readability;
+    bool isVertical = (ylen > xlen && ylen > zlen);
+    bool isDeep = (zlen > ylen && zlen > xlen);
+
+    if (isVertical) {
+        // Object is vertical (Y longest) — rotate text 90° so it reads vertically
+        switch (face) {
+            case LabelFace::Front:
+            case LabelFace::Back:
+                readability = osg::Quat(osg::PI_2, osg::Vec3(0,0,1)); break;
+            case LabelFace::Right:
+            case LabelFace::Left:
+                readability = osg::Quat(osg::PI_2, osg::Vec3(1,0,0)); break;
+            default: break;
+        }
+    } else if (isDeep) {
+        // Object is deep (Z longest) — rotate text 90° on top/bottom
+        switch (face) {
+            case LabelFace::Top:
+                readability = osg::Quat(osg::PI_2, osg::Vec3(0,1,0)); break;
+            case LabelFace::Bottom:
+                readability = osg::Quat(-osg::PI_2, osg::Vec3(0,1,0)); break;
+            default: break;
+        }
+    }
+
+    // Order: readability * base — readability is applied in the face plane
+    // so it comes after the base orientation.
+    return readability * base;
+}
+
+osg::Node* OsgScene::makeTextGeodeForFace(const std::string& text,
+                                           float centerX,
+                                           float centerY,
+                                           float centerZ,
+                                           float charSize,
+                                           const osg::Vec4& color,
+                                           const osg::Quat& rotation) {
+    if (text.empty() || !fontAtlas_ || !fontAtlas_->isValid()) {
+        return nullptr;
+    }
+
+    // Font atlas renders at FONT_SIZE=40px; scale to requested charSize
+    float scale = charSize / static_cast<float>(OsgFontAtlas::FONT_SIZE);
+
+    // DEBUG: Log transform info
+    static int xformDebugCount = 0;
+    if (xformDebugCount < 5) {
+        fprintf(stderr, "DEBUG xform: text=%s center=(%.2f,%.2f,%.2f) charSize=%.3f scale=%.6f\n",
+                text.c_str(), centerX, centerY, centerZ, charSize, scale);
+        xformDebugCount++;
+    }
+
+    // OsgTextGeode creates centered text at origin, at font atlas scale
+    OsgTextGeode* textGeode = new OsgTextGeode(text, fontAtlas_.get(), color);
+    textGeode->setName("label:" + text);
+
+    // Apply transform: scale, rotate, translate
+    // OSG uses row vectors: v' = v * scale * rotate * translate
+    osg::MatrixTransform* mt = new osg::MatrixTransform();
+    mt->setName("labelXform:" + text);
+    osg::Matrixd matrix = osg::Matrixd::scale(scale, scale, scale)
+                          * osg::Matrixd::rotate(rotation)
+                          * osg::Matrixd::translate(centerX, centerY, centerZ);
+    mt->setMatrix(matrix);
+    mt->addChild(textGeode);
+
+    // DEBUG: Check first vertex after transform
+    static int vertWorldDebugCount = 0;
+    if (vertWorldDebugCount < 3 && text == "_484_") {
+        osg::Vec3f testVert(0, 0, 0);  // Original vertex at origin
+        osg::Vec3f transformed = testVert * matrix;
+        fprintf(stderr, "DEBUG vertWorld: text=%s orig=(0,0,0) transformed=(%.4f,%.4f,%.4f)\n",
+                text.c_str(), transformed.x(), transformed.y(), transformed.z());
+        vertWorldDebugCount++;
+    }
+
+    return mt;
+}
+
+void OsgScene::removeObjectLabels(const std::string& objectId) {
+    auto it = textLabelNodes_.find(objectId);
+    if (it != textLabelNodes_.end()) {
+        osg::Group* labelGroup = it->second.get();
+        if (labelGroup) {
+            osg::Group* parent = labelGroup->getParent(0);
+            if (parent) {
+                parent->removeChild(labelGroup);
+            }
+        }
+        textLabelNodes_.erase(it);
+    }
+}
+
+void OsgScene::attachObjectGeometry(osg::Geode* geode,
+                                    const domain::ObjectRecord& obj,
+                                    const domain::LayerRecord* layer) {
+    if (!geode) {
+        return;
+    }
+
+    auto addLayerColoredDrawable = [&](osg::Geometry* geom, float alphaScale = 1.0F) {
+        if (!geom) {
+            return;
+        }
+        if (layer) {
+            applyFlatColor(geom,
+                           osg::Vec4(layer->color.r,
+                                     layer->color.g,
+                                     layer->color.b,
+                                     (1.0F - layer->transparency) * alphaScale));
+        }
+        geode->addDrawable(geom);
+    };
+
+    switch (obj.type) {
+        case domain::ObjectType::Inst: {
+            const LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.3F);
+            osg::Geometry* geom = createBoxGeometry(
+                box.xOffset, box.yOffset, box.width, box.height, box.depth);
             if (geom) {
                 if (layer) {
                     const float alpha = std::max(0.15F, 1.0F - std::max(layer->transparency, 0.55F));
@@ -619,160 +1252,101 @@ OsgSceneObject* OsgScene::createSceneObject(const domain::ObjectRecord& obj, con
         case domain::ObjectType::Blockage:
         case domain::ObjectType::Pin:
         case domain::ObjectType::Bump: {
-            // Create box from real bbox dimensions when available.
-            float width = 1.0F, height = 1.0F, depth = 0.3F;
-            float xOffset = 0.0F, yOffset = 0.0F;
-            if (obj.hasBbox) {
-                width = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
-                height = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
-                depth = std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2]);
-                xOffset = obj.bboxMin[0] - obj.transform[12];
-                yOffset = obj.bboxMin[1] - obj.transform[13];
-            } else if (layer) {
-                depth = std::max(layer->lineWidth * 0.5F, 0.05F);
+            LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.3F);
+            if (!obj.hasBbox && layer) {
+                box.depth = std::max(layer->lineWidth * 0.5F, 0.05F);
             }
-            osg::Geometry* geom = createBoxGeometry(xOffset, yOffset, width, height, depth);
-            if (geom) {
-                if (layer) {
-                    applyFlatColor(geom, osg::Vec4(layer->color.r, layer->color.g, layer->color.b,
-                                                   1.0F - layer->transparency));
-                }
-                geode->addDrawable(geom);
-            }
+            osg::Geometry* geom = createBoxGeometry(
+                box.xOffset, box.yOffset, box.width, box.height, box.depth);
+            addLayerColoredDrawable(geom);
             break;
         }
         case domain::ObjectType::Wire: {
-            // English comment.
-            // Transform is center, so geometry needs offset so that center + offset = bboxMin
-            // We pass the offset to createPolylineGeometry via xOffset/yOffset params
-            float xOffset = 0.0F, yOffset = 0.0F;
+            float xOffset = 0.0F;
+            float yOffset = 0.0F;
             if (obj.hasBbox) {
-                float centerX = obj.transform[12];
-                float centerY = obj.transform[13];
-                xOffset = obj.bboxMin[0] - centerX;  // negative = geometry left of center
-                yOffset = obj.bboxMin[1] - centerY;  // negative = geometry below center
+                const float centerX = obj.transform[12];
+                const float centerY = obj.transform[13];
+                xOffset = obj.bboxMin[0] - centerX;
+                yOffset = obj.bboxMin[1] - centerY;
             }
             osg::Geometry* geom = createPolylineGeometry(obj, layer, xOffset, yOffset);
-            if (geom) {
-                if (layer) {
-                    applyFlatColor(geom, osg::Vec4(layer->color.r, layer->color.g, layer->color.b,
-                                                   1.0F - layer->transparency));
-                }
-                geode->addDrawable(geom);
-            }
+            addLayerColoredDrawable(geom);
             break;
         }
         case domain::ObjectType::Via:
         case domain::ObjectType::Drc:
         case domain::ObjectType::Track: {
-            // English comment.
-            // Transform uses center, so geometry must be offset to match bboxMin
-            float width = 1.0F, height = 1.0F;
-            float depth = 0.05F;
-            float xOffset = 0.0F, yOffset = 0.0F;
-            if (obj.hasBbox) {
-                width = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
-                height = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
-                depth = std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2]);
-                // Calculate center from transform and offset geometry to match bboxMin
-                float centerX = obj.transform[12];
-                float centerY = obj.transform[13];
-                xOffset = obj.bboxMin[0] - centerX;
-                yOffset = obj.bboxMin[1] - centerY;
-            }
-            osg::Geometry* geom = createBoxGeometry(xOffset, yOffset, width, height, depth);
-            if (geom) {
-                if (layer) {
-                    applyFlatColor(geom, osg::Vec4(layer->color.r, layer->color.g, layer->color.b,
-                                                   1.0F - layer->transparency));
-                }
-                geode->addDrawable(geom);
-            }
+            const LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.05F);
+            osg::Geometry* geom = createBoxGeometry(
+                box.xOffset, box.yOffset, box.width, box.height, box.depth);
+            addLayerColoredDrawable(geom);
             break;
         }
         default: {
-            // English comment.
-            // English comment.
-            float width = 1.0F, height = 1.0F;
-            float depth = 0.2F;
-            float xOffset = 0.0F;
-            float yOffset = 0.0F;
-            if (obj.hasBbox) {
-                width = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
-                height = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
-                depth = std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2]);
-                xOffset = obj.bboxMin[0];
-                yOffset = obj.bboxMin[1];
-            }
-            osg::Geometry* geom = createBoxGeometry(xOffset, yOffset, width, height, depth);
-            if (geom) {
-                if (layer) {
-                    applyFlatColor(geom, osg::Vec4(layer->color.r, layer->color.g, layer->color.b,
-                                                   1.0F - layer->transparency));
-                }
-                geode->addDrawable(geom);
-            }
+            const LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.2F, 0.01F, false);
+            osg::Geometry* geom = createBoxGeometry(
+                box.xOffset, box.yOffset, box.width, box.height, box.depth);
+            addLayerColoredDrawable(geom);
             break;
         }
     }
-    
-    // English comment.
-    if (layer) {
-        osg::StateSet* stateset = geode->getOrCreateStateSet();
-        stateset->setMode(GL_LIGHTING, osg::StateAttribute::ON);
+}
 
-        osg::Material* material = new osg::Material();
-        material->setColorMode(osg::Material::AMBIENT_AND_DIFFUSE);
-        const float baseR = std::clamp(layer->color.r, 0.0F, 1.0F);
-        const float baseG = std::clamp(layer->color.g, 0.0F, 1.0F);
-        const float baseB = std::clamp(layer->color.b, 0.0F, 1.0F);
-          const float legoR = std::clamp(baseR * 1.08F, 0.0F, 1.0F);
-          const float legoG = std::clamp(baseG * 1.08F, 0.0F, 1.0F);
-          const float legoB = std::clamp(baseB * 1.08F, 0.0F, 1.0F);
-          const float effectiveTransparency = (obj.type == domain::ObjectType::Inst)
-            ? std::max(layer->transparency, 0.55F)
-            : layer->transparency;
-        material->setAmbient(osg::Material::FRONT_AND_BACK,
-                     osg::Vec4(legoR * 0.22F,
-                           legoG * 0.22F,
-                           legoB * 0.22F,
-                       1.0F - effectiveTransparency));
-        material->setDiffuse(osg::Material::FRONT_AND_BACK,
-                     osg::Vec4(legoR,
-                           legoG,
-                           legoB,
-                               1.0F - effectiveTransparency));
-        material->setSpecular(osg::Material::FRONT_AND_BACK,
-                      osg::Vec4(0.18F, 0.18F, 0.18F, 1.0F));
-        material->setShininess(osg::Material::FRONT_AND_BACK, 36.0F);
-        stateset->setAttributeAndModes(material, osg::StateAttribute::ON);
-
-        osg::ShadeModel* shade = new osg::ShadeModel(osg::ShadeModel::SMOOTH);
-        stateset->setAttributeAndModes(shade, osg::StateAttribute::ON);
-
-        // English comment.
-        osg::LineWidth* lw = new osg::LineWidth(layer->lineWidth);
-        stateset->setAttributeAndModes(lw, osg::StateAttribute::ON);
-        
-        // English comment.
-        osg::PolygonMode* pm = new osg::PolygonMode(osg::PolygonMode::FRONT_AND_BACK, osg::PolygonMode::FILL);
-        stateset->setAttributeAndModes(pm, osg::StateAttribute::ON);
-        
-        // English comment.
-        applyStipple(stateset, layer->lineStyle, layer->stippleId);
-        
-        // English comment.
-        if (effectiveTransparency > 0.0F) {
-            stateset->setMode(GL_BLEND, osg::StateAttribute::ON);
-            stateset->setRenderingHint(osg::StateSet::TRANSPARENT_BIN);
-        }
-        
-        // English comment.
-        stateset->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
+void OsgScene::configureGeodeRenderState(osg::Geode* geode,
+                                         const domain::LayerRecord& layer,
+                                         domain::ObjectType objectType) {
+    if (!geode) {
+        return;
     }
-    
-    transform->addChild(geode);
-    return sceneObj;
+
+    osg::StateSet* stateset = geode->getOrCreateStateSet();
+    stateset->setMode(GL_LIGHTING, osg::StateAttribute::ON);
+
+    osg::Material* material = new osg::Material();
+    material->setColorMode(osg::Material::AMBIENT_AND_DIFFUSE);
+    const float baseR = std::clamp(layer.color.r, 0.0F, 1.0F);
+    const float baseG = std::clamp(layer.color.g, 0.0F, 1.0F);
+    const float baseB = std::clamp(layer.color.b, 0.0F, 1.0F);
+    const float legoR = std::clamp(baseR * 1.08F, 0.0F, 1.0F);
+    const float legoG = std::clamp(baseG * 1.08F, 0.0F, 1.0F);
+    const float legoB = std::clamp(baseB * 1.08F, 0.0F, 1.0F);
+    const float effectiveTransparency = (objectType == domain::ObjectType::Inst)
+                                            ? std::max(layer.transparency, 0.55F)
+                                            : layer.transparency;
+    material->setAmbient(osg::Material::FRONT_AND_BACK,
+                         osg::Vec4(legoR * 0.22F,
+                                   legoG * 0.22F,
+                                   legoB * 0.22F,
+                                   1.0F - effectiveTransparency));
+    material->setDiffuse(osg::Material::FRONT_AND_BACK,
+                         osg::Vec4(legoR,
+                                   legoG,
+                                   legoB,
+                                   1.0F - effectiveTransparency));
+    material->setSpecular(osg::Material::FRONT_AND_BACK,
+                          osg::Vec4(0.18F, 0.18F, 0.18F, 1.0F));
+    material->setShininess(osg::Material::FRONT_AND_BACK, 36.0F);
+    stateset->setAttributeAndModes(material, osg::StateAttribute::ON);
+
+    osg::ShadeModel* shade = new osg::ShadeModel(osg::ShadeModel::SMOOTH);
+    stateset->setAttributeAndModes(shade, osg::StateAttribute::ON);
+
+    osg::LineWidth* lw = new osg::LineWidth(layer.lineWidth);
+    stateset->setAttributeAndModes(lw, osg::StateAttribute::ON);
+
+    osg::PolygonMode* pm
+        = new osg::PolygonMode(osg::PolygonMode::FRONT_AND_BACK, osg::PolygonMode::FILL);
+    stateset->setAttributeAndModes(pm, osg::StateAttribute::ON);
+
+    applyStipple(stateset, layer.lineStyle, layer.stippleId);
+
+    if (effectiveTransparency > 0.0F) {
+        stateset->setMode(GL_BLEND, osg::StateAttribute::ON);
+        stateset->setRenderingHint(osg::StateSet::TRANSPARENT_BIN);
+    }
+
+    stateset->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
 }
 
 // English comment.

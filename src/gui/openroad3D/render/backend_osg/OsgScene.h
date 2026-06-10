@@ -7,6 +7,7 @@
 
 #include <osg/ref_ptr>
 #include <osg/Object>
+#include <osg/Quat>
 #include <osg/Group>
 #include <osg/Switch>
 #include <osg/Geometry>
@@ -38,6 +39,7 @@ class OsgMaterial;
 class OsgLightSystem;
 class OsgTexture;
 class OsgTextureFactory;
+class OsgFontAtlas;
 
 /**
  * @brief English description.
@@ -146,6 +148,10 @@ public:
     
     // English comment.
     void loadSnapshot(const domain::SceneSnapshot& snapshot);
+    void upsertObjects(const std::vector<domain::ObjectRecord>& objects);
+    void updateObjectVisibility(const std::vector<std::pair<std::string, bool>>& visibilityUpdates);
+    void removeObjectsById(const std::vector<std::string>& objectIds);
+    void removeLayersById(const std::vector<std::string>& layerIds);
     void setSelectedObject(const std::string& objectId);
     osg::Node* getObjectNode(const std::string& objectId) const;
     
@@ -154,6 +160,10 @@ public:
     
     // English comment.
     OsgSceneObject* createSceneObject(const domain::ObjectRecord& obj, const domain::LayerRecord* layer);
+    
+    // Name label display control
+    void setDisplayNamesVisible(bool visible);
+    bool isDisplayNamesVisible() const { return displayNamesVisible_; }
 
 private:
     osg::ref_ptr<osg::Group> objectRoot_;
@@ -165,18 +175,53 @@ private:
     std::unordered_map<std::string, osg::ref_ptr<osg::Node>> highlightNodes_;
     std::string previousSelectedId_;
     
+    // Name label display state
+    bool displayNamesVisible_ = false;
+    std::unordered_map<std::string, osg::ref_ptr<osg::Group>> textLabelNodes_;
+    std::unordered_map<std::string, domain::ObjectRecord> objectRecordsById_;
+    
+    // Font atlas for text rendering (stb_truetype approach)
+    std::unique_ptr<OsgFontAtlas> fontAtlas_;
+    
     std::vector<osg::ref_ptr<osg::Light>> lights_;
     osg::ref_ptr<osg::Light> mainLight_;
     
     osg::ref_ptr<osg::Texture2D> defaultTexture_;
     
     void applyStipple(osg::StateSet* stateset, domain::LineStyle lineStyle, const std::string& stippleId);
+    void attachObjectGeometry(osg::Geode* geode,
+                              const domain::ObjectRecord& obj,
+                              const domain::LayerRecord* layer);
+    void configureGeodeRenderState(osg::Geode* geode,
+                                   const domain::LayerRecord& layer,
+                                   domain::ObjectType objectType);
     osg::Geometry* createBoxGeometry(float x, float y, float width, float height, float depth);
     osg::Geometry* createPolylineGeometry(const domain::ObjectRecord& obj, const domain::LayerRecord* layer, float xOffset = 0.0f, float yOffset = 0.0f);
     osg::Geometry* createPointGeometry(float size);
     void applyGlowMaterial(osg::Node* node);
     void restoreObjectMaterial(osg::Node* node);
     osg::Geometry* createSelectionGeometry(osg::Node* node);
+    
+    // Initialize font atlas (tries common system paths)
+    bool initFontAtlas();
+
+    // Label face orientation (glview-style)
+    enum class LabelFace { Front, Back, Right, Left, Top, Bottom };
+
+    // Name label helpers (glview-style text on faces)
+    void attachObjectLabels(osg::MatrixTransform* transform, const domain::ObjectRecord& obj, const domain::LayerRecord* layer);
+    void removeObjectLabels(const std::string& objectId);
+    osg::Node* makeTextGeodeForFace(const std::string& text,
+                                    float centerX,
+                                    float centerY,
+                                    float centerZ,
+                                    float charSize,
+                                    const osg::Vec4& color,
+                                    const osg::Quat& rotation);
+    osg::Quat computeFaceRotation(LabelFace face,
+                                  float xlen,
+                                  float ylen,
+                                  float zlen) const;
 };
 
 }  // namespace backend_osg

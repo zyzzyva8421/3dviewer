@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <sstream>
 
@@ -240,6 +241,21 @@ viewer3d::domain::ColorRgba colorFromLayerName(const std::string& name) {
   return color;
 }
 
+std::string makePointerObjectId(const void* ptr,
+                                const std::string& category,
+                                int index = -1,
+                                const std::string& role = "") {
+  std::ostringstream oss;
+  oss << "ptr_" << ptr << "_" << category;
+  if (index >= 0) {
+    oss << "_" << index;
+  }
+  if (!role.empty()) {
+    oss << "_" << role;
+  }
+  return oss.str();
+}
+
 }  // anonymous namespace
 
 OdbSceneBuilder::OdbSceneBuilder(odb::dbDatabase* db) : db_(db), object_id_counter_(0) {
@@ -313,7 +329,7 @@ void OdbSceneBuilder::processInstances(viewer3d::domain::SceneSnapshot& snapshot
 
   for (auto inst : block->getInsts()) {
     viewer3d::domain::ObjectRecord obj;
-    obj.objectId = generateObjectId("inst");
+    obj.objectId = makePointerObjectId(inst, "inst");
     obj.type = viewer3d::domain::ObjectType::Inst;
     obj.displayName = inst->getName();
 
@@ -452,10 +468,11 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
     itr.begin(wire);
 
     odb::dbShape shape;
+    int shapeIndex = 0;
     while (itr.next(shape)) {
       total_shapes++;
       viewer3d::domain::ObjectRecord obj;
-      obj.objectId = generateObjectId("wire");
+      obj.objectId = makePointerObjectId(wire, "wire", shapeIndex);
       obj.type = viewer3d::domain::ObjectType::Wire;
       obj.displayName = netName;
 
@@ -623,9 +640,9 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
         // Create via_top object - use the TOP metal layer's name (same physical layer)
         {
           viewer3d::domain::ObjectRecord viaTop;
-          viaTop.objectId = generateObjectId("via_top");
+          viaTop.objectId = makePointerObjectId(wire, "via", shapeIndex, "top");
           viaTop.type = viewer3d::domain::ObjectType::Via;
-          viaTop.displayName = netName + "_" + viaLayerName + "_top";
+          viaTop.displayName = netName;
           viaTop.styleRef = "via_top";
           viaTop.groupId = viaGroupId;  // Group all via parts together
 
@@ -660,9 +677,9 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
         // Create via_bottom object - use the BOTTOM metal layer's name
         {
           viewer3d::domain::ObjectRecord viaBottom;
-          viaBottom.objectId = generateObjectId("via_bottom");
+          viaBottom.objectId = makePointerObjectId(wire, "via", shapeIndex, "bottom");
           viaBottom.type = viewer3d::domain::ObjectType::Via;
-          viaBottom.displayName = netName + "_" + viaLayerName + "_bottom";
+          viaBottom.displayName = netName;
           viaBottom.styleRef = "via_bottom";
           viaBottom.groupId = viaGroupId;
 
@@ -695,9 +712,9 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
         // Create via_cut object (the cut layer between metals)
         {
           viewer3d::domain::ObjectRecord viaCut;
-          viaCut.objectId = generateObjectId("via_cut");
+          viaCut.objectId = makePointerObjectId(wire, "via", shapeIndex, "cut");
           viaCut.type = viewer3d::domain::ObjectType::Via;
-          viaCut.displayName = netName + "_" + viaLayerName + "_cut";
+          viaCut.displayName = netName;
           viaCut.styleRef = "via_cut";
           viaCut.groupId = viaGroupId;  // Group all via parts together
 
@@ -764,6 +781,8 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
 
         snapshot.objects.push_back(obj);
       }
+
+      shapeIndex++;
     }
   }
 }
@@ -781,7 +800,7 @@ void OdbSceneBuilder::processPins(viewer3d::domain::SceneSnapshot& snapshot) {
   // Top-level IO pins (BTerms)
   for (auto bterm : block->getBTerms()) {
     viewer3d::domain::ObjectRecord obj;
-    obj.objectId = generateObjectId("pin");
+    obj.objectId = makePointerObjectId(bterm, "bterm_pin");
     obj.type = viewer3d::domain::ObjectType::Pin;
     obj.displayName = bterm->getName();
 
@@ -848,6 +867,7 @@ void OdbSceneBuilder::processPins(viewer3d::domain::SceneSnapshot& snapshot) {
       odb::dbITermShapeItr itr(true);
       itr.begin(iterm);
       odb::dbShape shape;
+      int shapeIndex = 0;
       while (itr.next(shape)) {
         odb::dbTechLayer* pinLayer = shape.getTechLayer();
         if (!pinLayer) {
@@ -855,7 +875,7 @@ void OdbSceneBuilder::processPins(viewer3d::domain::SceneSnapshot& snapshot) {
         }
 
         viewer3d::domain::ObjectRecord obj;
-        obj.objectId = generateObjectId("inst_pin");
+        obj.objectId = makePointerObjectId(iterm, "iterm_pin", shapeIndex);
         obj.type = viewer3d::domain::ObjectType::Pin;
 
         std::string instName = inst->getName();
@@ -887,6 +907,7 @@ void OdbSceneBuilder::processPins(viewer3d::domain::SceneSnapshot& snapshot) {
         obj.layerId = layerRec ? layerRec->layerId : "pin";
 
         snapshot.objects.push_back(obj);
+        shapeIndex++;
       }
     }
   }

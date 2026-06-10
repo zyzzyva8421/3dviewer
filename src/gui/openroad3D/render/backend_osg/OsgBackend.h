@@ -81,6 +81,9 @@ class OsgBackend : public IRenderBackend {
   
   void loadScene(const domain::SceneSnapshot& snapshot) override;
   void updateLayerState(const domain::LayerRecord& layer) override;
+  void updateObjects(const std::vector<domain::ObjectRecord>& objects) override;
+  void removeObjects(const std::vector<std::string>& objectIds) override;
+  void removeLayers(const std::vector<std::string>& layerIds) override;
   void clearScene() override;
   
   void setToolMode(ToolMode mode) override;
@@ -105,6 +108,9 @@ class OsgBackend : public IRenderBackend {
   bool isShadowEnabled() const override;
   
   bool saveScreenshot(const std::string& filePath) override;
+  
+  void setDisplayNamesVisible(bool visible) override;
+  bool isDisplayNamesVisible() const override;
 
  private:
   friend class OsgViewWidget;

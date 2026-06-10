@@ -1,0 +1,106 @@
+{
+  "sourceTag": "openroad_db",
+  "layerCount": 12,
+  "objectCount": 22443,
+  "instCount": 926,
+  "wireCount": 3074,
+  "viaCount": 10452,
+  "viaGroupCount": 1306,
+  "pinCount": 7991,
+  "bboxMin": [
+    0,
+    0,
+    0
+  ],
+  "bboxMax": [
+    36.09,
+    36.09,
+    1.495
+  ],
+  "layers": [
+    {
+      "name": "instance",
+      "layerId": "instance",
+      "zBase": 0,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "metal1",
+      "layerId": "metal1",
+      "zBase": 0.065,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "via24_cut",
+      "layerId": "via24_cut",
+      "zBase": 0.1475,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "metal2",
+      "layerId": "metal2",
+      "zBase": 0.235,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "via46_cut",
+      "layerId": "via46_cut",
+      "zBase": 0.3225,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "metal3",
+      "layerId": "metal3",
+      "zBase": 0.41,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "via68_cut",
+      "layerId": "via68_cut",
+      "zBase": 0.4975,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "metal4",
+      "layerId": "metal4",
+      "zBase": 0.655,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "via810_cut",
+      "layerId": "via810_cut",
+      "zBase": 0.83,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "metal5",
+      "layerId": "metal5",
+      "zBase": 1.005,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "via1012_cut",
+      "layerId": "via1012_cut",
+      "zBase": 1.18,
+      "thickness": 0.3,
+      "visible": true
+    },
+    {
+      "name": "metal6",
+      "layerId": "metal6",
+      "zBase": 1.355,
+      "thickness": 0.3,
+      "visible": true
+    }
+  ]
+}

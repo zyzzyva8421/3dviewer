@@ -91,7 +91,7 @@ void OpenRoad3DWindow::setupUi() {
   toolbarLayout->addSpacing(8);
   toolbarLayout->addWidget(new QLabel("Names:", mainArea));
   showNamesCheck_ = new QCheckBox("Show", mainArea);
-  showNamesCheck_->setChecked(false);
+  showNamesCheck_->setChecked(true);  // Default to showing names
   toolbarLayout->addWidget(showNamesCheck_);
   toolbarLayout->addStretch();
   toolbarLayout->addWidget(statusLabel_);
@@ -175,6 +175,7 @@ void OpenRoad3DWindow::setupUi() {
       viewLayout_->addWidget(currentView_);
     }
     backend_->setToolMode(currentToolMode_);
+    backend_->setDisplayNamesVisible(true);  // Enable display names by default
   }
 
   // Connect signals - tools

@@ -55,6 +55,7 @@ struct ObjectRecord {
   ObjectType type = ObjectType::Unknown;
   std::string layerId;
   std::string groupId;  // Groups related objects (e.g., via_top, via_bottom, via_cut)
+  bool visible = true;
   std::array<float, 16> transform {
       1.0F, 0.0F, 0.0F, 0.0F,
       0.0F, 1.0F, 0.0F, 0.0F,

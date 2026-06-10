@@ -53,8 +53,8 @@ class OdbSceneBuilder {
   std::string generateObjectId(const std::string& prefix);
 
   odb::dbDatabase* db_;
-  int db_units_per_micron_;
-  int object_id_counter_;
+  int db_units_per_micron_ = 0;
+  int object_id_counter_ = 0;
 };
 
 }  // namespace openroad3d

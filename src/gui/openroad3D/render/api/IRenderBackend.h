@@ -105,6 +105,24 @@ class IRenderBackend {
    * @param layer Parameter description.
    */
   virtual void updateLayerState(const domain::LayerRecord& layer) = 0;
+
+  /**
+   * @brief Apply incremental object updates without reloading the full scene.
+   * @param objects Parameter description.
+   */
+  virtual void updateObjects(const std::vector<domain::ObjectRecord>& objects) = 0;
+
+  /**
+   * @brief Remove objects incrementally by object IDs.
+   * @param objectIds Parameter description.
+   */
+  virtual void removeObjects(const std::vector<std::string>& objectIds) = 0;
+
+  /**
+   * @brief Remove layers incrementally by layer IDs.
+   * @param layerIds Parameter description.
+   */
+  virtual void removeLayers(const std::vector<std::string>& layerIds) = 0;
   
   /**
    * @brief English description.
@@ -213,8 +231,18 @@ class IRenderBackend {
    * @param filePath Parameter description.
    * @return Return value description.
    */
-  virtual bool saveScreenshot(const std::string& filePath) = 0;
-};
+  virtual bool saveScreenshot(const std::string& filePath) = 0;  
+  /**
+   * @brief Set whether display names (labels) are visible on3D objects.
+   * @param visible true to show names, false to hide
+   */
+  virtual void setDisplayNamesVisible(bool visible) = 0;
+  
+  /**
+   * @brief Query whether display names are visible.
+   * @return true if names are visible
+   */
+  virtual bool isDisplayNamesVisible() const = 0;};
 
 // English comment.
 

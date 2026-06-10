@@ -41,6 +41,10 @@ set(OPENROAD3D_SOURCES
     render/backend_osg/OsgScene.h
     render/backend_osg/OsgTexture.cpp
     render/backend_osg/OsgTexture.h
+    render/backend_osg/OsgFontAtlas.cpp
+    render/backend_osg/OsgFontAtlas.h
+    render/backend_osg/OsgTextGeode.cpp
+    render/backend_osg/OsgTextGeode.h
 )
 
 add_executable(openroad_3d ${OPENROAD3D_SOURCES})
@@ -76,3 +80,9 @@ target_compile_options(openroad_3d PRIVATE "-fno-lto")
 target_link_options(openroad_3d PRIVATE "-fno-lto")
 
 install(TARGETS openroad_3d RUNTIME DESTINATION bin)
+
+# Tests (disabled by default, enable with -DENABLE_TESTS=ON)
+option(ENABLE_OPENROAD3D_TESTS "Enable OpenROAD 3D viewer unit tests" OFF)
+if(ENABLE_OPENROAD3D_TESTS)
+  add_subdirectory(test)
+endif()
