@@ -44,47 +44,80 @@ bool OsgFontAtlas::initFont(const std::string& filename) {
     if (fontData.empty()) {
         return false;
     }
-    
-    // Allocate atlas data
-    atlasData_ = std::make_unique<uint8_t[]>(ATLAS_WIDTH * ATLAS_HEIGHT);
+
+    // Allocate temp 1-byte-per-pixel buffer for stb_truetype packing
+    std::unique_ptr<uint8_t[]> tempAtlas(new uint8_t[ATLAS_WIDTH * ATLAS_HEIGHT]);
+
     // charInfo_ should be CHAR_COUNT entries of stbtt_packedchar
     charInfo_.resize(CHAR_COUNT * sizeof(stbtt_packedchar));
-    
+
     stbtt_pack_context context;
-    if (!stbtt_PackBegin(&context, atlasData_.get(), ATLAS_WIDTH, ATLAS_HEIGHT, 0, 1, nullptr)) {
+    if (!stbtt_PackBegin(&context, tempAtlas.get(), ATLAS_WIDTH, ATLAS_HEIGHT, 0, 1, nullptr)) {
         fprintf(stderr, "Failed to initialize font atlas\n");
         return false;
     }
-    
+
     stbtt_PackSetOversampling(&context, 2, 2);
-    
+
     stbtt_packedchar* charInfo = reinterpret_cast<stbtt_packedchar*>(charInfo_.data());
     if (!stbtt_PackFontRange(&context, fontData.data(), 0, FONT_SIZE, FIRST_CHAR, CHAR_COUNT, charInfo)) {
         fprintf(stderr, "Failed to pack font atlas\n");
         stbtt_PackEnd(&context);
         return false;
     }
-    
+
     stbtt_PackEnd(&context);
-    
+
+    // Allocate 4-bytes-per-pixel atlas (RGBA) and convert coverage to RGBA
+    // stb_truetype with 2x2 oversampling produces coverage values averaged over 4 sub-pixels
+    // A fully covered pixel has coverage ≈ 4 (max), so multiply by 64 to get full 0-255 range
+    atlasData_ = std::make_unique<uint8_t[]>(ATLAS_WIDTH * ATLAS_HEIGHT * 4);
+    int nonZeroCount = 0;
+    for (int i = 0; i < ATLAS_WIDTH * ATLAS_HEIGHT; i++) {
+        uint8_t coverage = tempAtlas[i];
+        // Scale coverage by 64 to get full 0-255 range for visible white text
+        uint8_t scaledCoverage = std::min(255, coverage * 64);
+        atlasData_[4 * i] = scaledCoverage;     // R
+        atlasData_[4 * i + 1] = scaledCoverage; // G
+        atlasData_[4 * i + 2] = scaledCoverage; // B
+        atlasData_[4 * i + 3] = scaledCoverage; // A
+        if (coverage > 0) nonZeroCount++;
+    }
+    fprintf(stderr, "DEBUG initFont: atlas populated with %d non-zero pixels (out of %d)\n",
+            nonZeroCount, ATLAS_WIDTH * ATLAS_HEIGHT);
+
+    // DEBUG: find first non-zero pixel and check its coverage value
+    int firstNonZero = -1;
+    for (int i = 0; i < ATLAS_WIDTH * ATLAS_HEIGHT; i++) {
+        if (tempAtlas[i] > 0) {
+            firstNonZero = i;
+            break;
+        }
+    }
+    if (firstNonZero >= 0) {
+        fprintf(stderr, "DEBUG initFont: first non-zero pixel at index %d, coverage=%d\n",
+                firstNonZero, tempAtlas[firstNonZero]);
+    }
+
     // Create OSG texture from atlas
     createOsgTexture();
-    
+
     return texture_.valid();
 }
 
 void OsgFontAtlas::createOsgTexture() {
     osg::Image* image = new osg::Image();
+    // 2D RGBA texture: r=1 (depth), internalFormat=GL_RGBA
     // NO_DELETE: atlasData_ is owned by the unique_ptr member, not by OSG.
-    image->setImage(ATLAS_WIDTH, ATLAS_HEIGHT, 1, GL_ALPHA, GL_ALPHA, GL_UNSIGNED_BYTE, atlasData_.get(), osg::Image::NO_DELETE);
-    
+    image->setImage(ATLAS_WIDTH, ATLAS_HEIGHT, 1, GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE, atlasData_.get(), osg::Image::NO_DELETE);
+
     texture_ = new osg::Texture2D();
     texture_->setImage(image);
     texture_->setWrap(osg::Texture::WRAP_S, osg::Texture::CLAMP_TO_EDGE);
     texture_->setWrap(osg::Texture::WRAP_T, osg::Texture::CLAMP_TO_EDGE);
-    // Use LINEAR to match glview (glview uses GL_LINEAR for text rendering)
     texture_->setFilter(osg::Texture::MIN_FILTER, osg::Texture::LINEAR);
     texture_->setFilter(osg::Texture::MAG_FILTER, osg::Texture::LINEAR);
+    texture_->setMaxAnisotropy(1.0f);
 }
 
 GlyphInfo OsgFontAtlas::getGlyphInfo(uint32_t c, float offsetX, float offsetY) {
@@ -99,23 +132,24 @@ GlyphInfo OsgFontAtlas::getGlyphInfo(uint32_t c, float offsetX, float offsetY) {
     stbtt_packedchar* charInfo = reinterpret_cast<stbtt_packedchar*>(charInfo_.data());
     stbtt_GetPackedQuad(charInfo, ATLAS_WIDTH, ATLAS_HEIGHT, c - FIRST_CHAR, &offsetX, &offsetY, &quad, 1);
     
-    // flip_var=1 means y increases upward (OpenGL-style coords)
-    // stb_truetype returns y0 < y1 (y0 is top, y1 is bottom)
-    // We negate to convert: ymin = -y1 (bottom, lower Y), ymax = -y0 (top, higher Y)
-    // This gives ymin < ymax in OpenGL coords where Y increases upward
-    float ymin = -quad.y1;
-    float ymax = -quad.y0;
+    // Use quad directly like glview - stb_truetype handles coordinate transforms
+    // Y is flipped: y0=top, y1=bottom in stb_truetype, negate for OpenGL (Y up)
+    float xmin = quad.x0;
+    float xmax = quad.x1;
+    float ymin = -quad.y1;  // bottom (negate because stb_truetype Y increases downward)
+    float ymax = -quad.y0;  // top
     
     info.offsetX = offsetX;
     info.offsetY = offsetY;
     
-    // positions[4 * 3]: 4 vertices, x,y,z
-    info.positions[0] = quad.x0;  info.positions[1] = ymin;  info.positions[2] = 0;
-    info.positions[3] = quad.x0;  info.positions[4] = ymax;  info.positions[5] = 0;
-    info.positions[6] = quad.x1;  info.positions[7] = ymax;  info.positions[8] = 0;
-    info.positions[9] = quad.x1;  info.positions[10] = ymin; info.positions[11] = 0;
+    // positions[4 * 3]: 4 vertices, x,y,z - quad values (already absolute in atlas coords)
+    // After adding cursorX in OsgTextGeode, positions become absolute
+    info.positions[0] = xmin;  info.positions[1] = ymin;  info.positions[2] = 0;
+    info.positions[3] = xmin;  info.positions[4] = ymax;  info.positions[5] = 0;
+    info.positions[6] = xmax;  info.positions[7] = ymax;  info.positions[8] = 0;
+    info.positions[9] = xmax;  info.positions[10] = ymin; info.positions[11] = 0;
     
-    // uvs[4 * 2]: 4 vertices, u,v
+    // uvs[4 * 2]: 4 vertices, u,v - direct from quad like glview
     info.uvs[0] = quad.s0; info.uvs[1] = quad.t1;
     info.uvs[2] = quad.s0; info.uvs[3] = quad.t0;
     info.uvs[4] = quad.s1; info.uvs[5] = quad.t0;

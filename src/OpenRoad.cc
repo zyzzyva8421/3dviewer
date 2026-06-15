@@ -33,6 +33,8 @@
 #include "dft/Dft.hh"
 #include "dft/MakeDft.hh"
 #include "dpl/MakeOpendp.h"
+#include "xdp/MakeXdp.h"
+#include "xgp/MakeXgp.h"
 #include "dpl/Opendp.h"
 #include "drt/MakeTritonRoute.h"
 #include "drt/TritonRoute.h"
@@ -275,6 +277,8 @@ void OpenRoad::init(Tcl_Interp* tcl_interp,
   gpl::initReplace(tcl_interp);
   gpl::initReplaceGraphics(replace_, logger_);
   dpl::initOpendp(tcl_interp);
+  xdp::initXdp(tcl_interp);
+  xgp::initXgp(tcl_interp);
   fin::initFinale(tcl_interp);
   ram::initRamGen(tcl_interp);
   grt::initTcl(tcl_interp);

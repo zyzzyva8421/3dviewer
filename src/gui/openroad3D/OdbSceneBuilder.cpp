@@ -7,7 +7,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstdint>
-#include <map>
+#include <unordered_map>
 #include <sstream>
 
 #include "odb/db.h"
@@ -18,12 +18,28 @@ namespace openroad3d {
 
 namespace {
 
+// Debug flag controlled by environment variable
+bool isDebugEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("OPENROAD_3D_DEBUG");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+  }();
+  return enabled;
+}
+
+#define DEBUG_PRINT(...) \
+  do { if (isDebugEnabled()) fprintf(stderr, __VA_ARGS__); } while (0)
+
 // Cache for layer z positions: layer number -> zBase
 // Computed once using stacking formula: z = prev_z + prev_thickness/2 + current_thickness/2
-std::map<int, float> layerZCache;
+std::unordered_map<int, float> layerZCache;
 
 // Cache for layer thickness: layer number -> thickness
-std::map<int, float> layerThicknessCache;
+std::unordered_map<int, float> layerThicknessCache;
+
+// Layer lookup map: layer name -> pointer to LayerRecord in snapshot
+// This is populated during getOrCreateLayer for O(1) lookup
+std::unordered_map<std::string, viewer3d::domain::LayerRecord*> layerLookupMap;
 
 // Compute and cache all layer z positions based on stacking formula
 void computeLayerZPositions(odb::dbTech* tech, int db_units_per_micron) {
@@ -41,10 +57,10 @@ void computeLayerZPositions(odb::dbTech* tech, int db_units_per_micron) {
     layers.push_back(layer);
   }
 
-  fprintf(stderr, "DEBUG computeLayerZPositions: layer order:\n");
+  DEBUG_PRINT("DEBUG computeLayerZPositions: layer order:\n");
   for (size_t i = 0; i < layers.size(); ++i) {
     odb::dbTechLayer* layer = layers[i];
-    fprintf(stderr, "  [%zu] layer#%d name=%s type=%d\n", 
+    DEBUG_PRINT("  [%zu] layer#%d name=%s type=%d\n",
             i, layer->getNumber(), layer->getConstName(), (int)layer->getType());
   }
 
@@ -81,11 +97,6 @@ void computeLayerZPositions(odb::dbTech* tech, int db_units_per_micron) {
     }
     
     // Store thickness in a separate cache for use in layer display
-    layerThicknessCache[layer_num] = thickness;
-    
-        float top = zBottom + thickness;
-        fprintf(stderr, "  [%zu] layer#%d %s: zBottom=%.4f zCenter=%.4f top=%.4f thickness=%.4f\n",
-          i, layer_num, layer->getConstName(), zBottom, zCenter, top, thickness);
   }
 }
 
@@ -245,15 +256,38 @@ std::string makePointerObjectId(const void* ptr,
                                 const std::string& category,
                                 int index = -1,
                                 const std::string& role = "") {
-  std::ostringstream oss;
-  oss << "ptr_" << ptr << "_" << category;
+  // Use string concatenation instead of ostringstream for performance
+  std::string result = "ptr_";
+  result += std::to_string(reinterpret_cast<uintptr_t>(ptr));
+  result += "_";
+  result += category;
   if (index >= 0) {
-    oss << "_" << index;
+    result += "_";
+    result += std::to_string(index);
   }
   if (!role.empty()) {
-    oss << "_" << role;
+    result += "_";
+    result += role;
   }
-  return oss.str();
+  return result;
+}
+
+// Stipple pattern names for layer surface fill (matching winLayer.c patterns).
+static const char* kStippleNames[] = {
+    "horizontal", "vertical", "grid", "slash", "backslash",
+    "cross", "brick", "dot1", "dot2", "dot4",
+    "slash2", "backslash2", "dot8_1", "dot8_2",
+};
+static constexpr int kNumStippleNames = sizeof(kStippleNames) / sizeof(kStippleNames[0]);
+
+// Deterministic stipple selection from layer name hash.
+static const char* stippleForLayer(const std::string& layerName) {
+    int hash = 0;
+    for (char c : layerName) {
+        hash = hash * 31 + static_cast<int>(c);
+    }
+    int idx = std::abs(hash) % kNumStippleNames;
+    return kStippleNames[idx];
 }
 
 }  // anonymous namespace
@@ -281,19 +315,36 @@ float OdbSceneBuilder::dbuToMicrons(int dbu) const {
 }
 
 std::string OdbSceneBuilder::generateObjectId(const std::string& prefix) {
-  std::ostringstream oss;
-  oss << prefix << "_" << object_id_counter_++;
-  return oss.str();
+  // Use string concatenation instead of ostringstream for performance
+  std::string result = prefix;
+  result += "_";
+  result += std::to_string(object_id_counter_++);
+  return result;
 }
 
 viewer3d::domain::LayerRecord* OdbSceneBuilder::getOrCreateLayer(
     viewer3d::domain::SceneSnapshot& snapshot,
     const std::string& layerName,
     float zBase) {
-  // Check if layer already exists
-  for (auto& layer : snapshot.layers) {
-    if (layer.name == layerName) {
-      return &layer;
+  // O(1) lookup using layerLookupMap
+  auto it = layerLookupMap.find(layerName);
+  if (it != layerLookupMap.end()) {
+    viewer3d::domain::LayerRecord* layer = it->second;
+    // Update zBase if provided zBase differs (ensures consistency)
+    if (std::abs(layer->zBase - zBase) > 1e-6f) {
+      DEBUG_PRINT("DEBUG getOrCreateLayer: updating zBase for layer %s from %.4f to %.4f\n",
+                 layerName.c_str(), layer->zBase, zBase);
+      layer->zBase = zBase;
+    }
+    return layer;
+  }
+
+  // Look up layer direction from ODB tech
+  bool isHorizontal = true;  // default
+  if (db_ && db_->getTech()) {
+    odb::dbTechLayer* techLayer = db_->getTech()->findLayer(layerName.c_str());
+    if (techLayer) {
+      isHorizontal = (techLayer->getDirection() == odb::dbTechLayerDir::HORIZONTAL);
     }
   }
 
@@ -305,13 +356,20 @@ viewer3d::domain::LayerRecord* OdbSceneBuilder::getOrCreateLayer(
   layer.thickness = 0.3f;
   layer.visible = true;
   layer.selectable = true;
+  layer.isHorizontal = isHorizontal;
   layer.color = colorFromLayerName(layerName);
   layer.transparency = 0.0f;
   layer.lineWidth = 1.0f;
   layer.lineStyle = viewer3d::domain::LineStyle::Solid;
+  layer.stippleId = stippleForLayer(layerName);
 
   snapshot.layers.push_back(layer);
-  return &snapshot.layers.back();
+  viewer3d::domain::LayerRecord* newLayer = &snapshot.layers.back();
+
+  // Add to lookup map for O(1) future lookups
+  layerLookupMap[layerName] = newLayer;
+
+  return newLayer;
 }
 
 void OdbSceneBuilder::processInstances(viewer3d::domain::SceneSnapshot& snapshot) {
@@ -633,14 +691,13 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
         // Keep all Z definitions consistent as centers.
         // cutCenter = bottomCenter + bottomThickness/2 + cutThickness/2
         float viaZ = physBottomZ + bottomThickness / 2.0f + cutThickness / 2.0f;
-        fprintf(stderr, "DEBUG via calc: name=%s bot=%s botCenterZ=%.4f botT=%.4f cutT=%.4f cutCenterZ=%.4f\n",
+        DEBUG_PRINT("DEBUG via calc: name=%s bot=%s botCenterZ=%.4f botT=%.4f cutT=%.4f cutCenterZ=%.4f\n",
           viaLayerName.c_str(), physBottomLayer->getConstName(), physBottomZ,
           bottomThickness, cutThickness, viaZ);
 
         // Create via_top object - use the TOP metal layer's name (same physical layer)
         {
           viewer3d::domain::ObjectRecord viaTop;
-          viaTop.objectId = makePointerObjectId(wire, "via", shapeIndex, "top");
           viaTop.type = viewer3d::domain::ObjectType::Via;
           viaTop.displayName = netName;
           viaTop.styleRef = "via_top";
@@ -664,7 +721,7 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
 
           // Use the TOP metal layer's name - via_top is physically on that metal layer
           std::string topLayerName = physTopLayer->getName();
-          fprintf(stderr, "DEBUG via_top: topLayerName=%s physTopZ=%.4f viaZ=%.4f\n", 
+          DEBUG_PRINT("DEBUG via_top: topLayerName=%s physTopZ=%.4f viaZ=%.4f\n",
                   topLayerName.c_str(), physTopZ, viaZ);
           viewer3d::domain::LayerRecord* layerRec
               = getOrCreateLayer(snapshot, topLayerName, physTopZ);
@@ -769,6 +826,11 @@ void OdbSceneBuilder::processNets(viewer3d::domain::SceneSnapshot& snapshot) {
                         centerX, centerY, centerZ, 1.0f};
 
         obj.styleRef = "wire";
+
+        // Calculate wire direction from bbox: xlen > ylen means horizontal wire
+        float xlen = obj.bboxMax[0] - obj.bboxMin[0];
+        float ylen = obj.bboxMax[1] - obj.bboxMin[1];
+        obj.isHorizontal = (xlen > ylen);
 
         if (layer) {
           std::string layerName = layer->getName();
@@ -913,145 +975,210 @@ void OdbSceneBuilder::processPins(viewer3d::domain::SceneSnapshot& snapshot) {
   }
 }
 
-void OdbSceneBuilder::processVias(viewer3d::domain::SceneSnapshot& snapshot) {
-  odb::dbChip* chip = db_->getChip();
-  if (!chip) {
-    return;
-  }
+void OdbSceneBuilder::processBlockages(viewer3d::domain::SceneSnapshot& snapshot) {
+  odb::dbChip* chip = db_ ? db_->getChip() : nullptr;
+  if (!chip) return;
   odb::dbBlock* block = chip->getBlock();
-  if (!block) {
-    return;
-  }
+  if (!block) return;
 
-  // Note: Wire vias are already processed in processNets
-  // This processes block vias defined in the library
-
-  for (auto via : block->getVias()) {
-    odb::dbTechLayer* topLayer = via->getTopLayer();
-    odb::dbTechLayer* bottomLayer = via->getBottomLayer();
-    if (!topLayer || !bottomLayer) {
-      continue;
-    }
-
-    // Generate via layer name like "via12"
-    std::string viaLayerName = getViaLayerName(topLayer, bottomLayer);
-    float topThickness = getLayerThickness(topLayer, db_units_per_micron_);
-    float bottomThickness = getLayerThickness(bottomLayer, db_units_per_micron_);
-    float viaZ = getViaZBase(topLayer, bottomLayer);
-
-    // Get via bbox
-    odb::dbBox* bbox = via->getBBox();
-    if (!bbox) {
-      continue;
-    }
+  for (auto blockage : block->getBlockages()) {
+    odb::dbBox* bbox = blockage->getBBox();
+    if (!bbox) continue;
     odb::Rect rect = bbox->getBox();
 
-    // Create via_top object (on top metal layer)
-    {
-      viewer3d::domain::ObjectRecord viaTop;
-      viaTop.objectId = generateObjectId("via_top");
-      viaTop.type = viewer3d::domain::ObjectType::Via;
-      viaTop.displayName = via->getName() + "_" + viaLayerName + "_top";
-      viaTop.styleRef = "via_top";
+    viewer3d::domain::ObjectRecord obj;
+    obj.objectId = generateObjectId("blk");
+    obj.type = viewer3d::domain::ObjectType::Blockage;
+    obj.displayName = "blockage";
 
-      float topZ = getLayerZBase(topLayer);
-      viaTop.hasBbox = true;
-      viaTop.bboxMin[0] = dbuToMicrons(rect.xMin());
-      viaTop.bboxMin[1] = dbuToMicrons(rect.yMin());
-      viaTop.bboxMin[2] = topZ;
-      viaTop.bboxMax[0] = dbuToMicrons(rect.xMax());
-      viaTop.bboxMax[1] = dbuToMicrons(rect.yMax());
-      viaTop.bboxMax[2] = topZ + topThickness;
-
-      float centerX = (viaTop.bboxMin[0] + viaTop.bboxMax[0]) * 0.5f;
-      float centerY = (viaTop.bboxMin[1] + viaTop.bboxMax[1]) * 0.5f;
-      float centerZ = (viaTop.bboxMin[2] + viaTop.bboxMax[2]) * 0.5f;
-      viaTop.transform = {1.0f, 0.0f, 0.0f, 0.0f,
-                          0.0f, 1.0f, 0.0f, 0.0f,
-                          0.0f, 0.0f, 1.0f, 0.0f,
-                          centerX, centerY, centerZ, 1.0f};
-
-      viewer3d::domain::LayerRecord* layerRec
-          = getOrCreateLayer(snapshot, viaLayerName + "_top", topZ);
-      if (layerRec) {
-        viaTop.layerId = layerRec->layerId;
+    // Blockages default to z=0 if no layer info, but should use center convention
+    float zBase = 0.0f;
+    float thickness = 0.5f;
+    if (odb::dbTech* tech = db_->getTech()) {
+      if (odb::dbTechLayer* layer = tech->findLayer("metal1")) {
+        zBase = getLayerZBase(layer);
+        thickness = getLayerThickness(layer, db_units_per_micron_);
       }
-      snapshot.objects.push_back(viaTop);
     }
+    obj.hasBbox = true;
+    obj.bboxMin[0] = dbuToMicrons(rect.xMin());
+    obj.bboxMin[1] = dbuToMicrons(rect.yMin());
+    obj.bboxMin[2] = zBase - thickness * 0.5f;
+    obj.bboxMax[0] = dbuToMicrons(rect.xMax());
+    obj.bboxMax[1] = dbuToMicrons(rect.yMax());
+    obj.bboxMax[2] = zBase + thickness * 0.5f;
 
-    // Create via_bottom object (on bottom metal layer)
-    {
-      viewer3d::domain::ObjectRecord viaBottom;
-      viaBottom.objectId = generateObjectId("via_bottom");
-      viaBottom.type = viewer3d::domain::ObjectType::Via;
-      viaBottom.displayName = via->getName() + "_" + viaLayerName + "_bottom";
-      viaBottom.styleRef = "via_bottom";
+    float cx = (obj.bboxMin[0] + obj.bboxMax[0]) * 0.5f;
+    float cy = (obj.bboxMin[1] + obj.bboxMax[1]) * 0.5f;
+    float cz = (obj.bboxMin[2] + obj.bboxMax[2]) * 0.5f;
+    obj.transform = {1.0f, 0.0f, 0.0f, 0.0f,
+                    0.0f, 1.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 1.0f, 0.0f,
+                    cx, cy, cz, 1.0f};
 
-      float bottomZ = getLayerZBase(bottomLayer);
-      viaBottom.hasBbox = true;
-      viaBottom.bboxMin[0] = dbuToMicrons(rect.xMin());
-      viaBottom.bboxMin[1] = dbuToMicrons(rect.yMin());
-      viaBottom.bboxMin[2] = bottomZ;
-      viaBottom.bboxMax[0] = dbuToMicrons(rect.xMax());
-      viaBottom.bboxMax[1] = dbuToMicrons(rect.yMax());
-      viaBottom.bboxMax[2] = bottomZ + bottomThickness;
+    viewer3d::domain::LayerRecord* layer = getOrCreateLayer(snapshot, "blockage", zBase);
+    if (layer) obj.layerId = layer->layerId;
+    snapshot.objects.push_back(obj);
+  }
+}
 
-      float centerX = (viaBottom.bboxMin[0] + viaBottom.bboxMax[0]) * 0.5f;
-      float centerY = (viaBottom.bboxMin[1] + viaBottom.bboxMax[1]) * 0.5f;
-      float centerZ = (viaBottom.bboxMin[2] + viaBottom.bboxMax[2]) * 0.5f;
-      viaBottom.transform = {1.0f, 0.0f, 0.0f, 0.0f,
-                              0.0f, 1.0f, 0.0f, 0.0f,
-                              0.0f, 0.0f, 1.0f, 0.0f,
-                              centerX, centerY, centerZ, 1.0f};
+void OdbSceneBuilder::processDrcMarkers(viewer3d::domain::SceneSnapshot& snapshot) {
+  odb::dbChip* chip = db_ ? db_->getChip() : nullptr;
+  if (!chip) return;
+  odb::dbBlock* block = chip->getBlock();
+  if (!block) return;
 
-      viewer3d::domain::LayerRecord* layerRec
-          = getOrCreateLayer(snapshot, viaLayerName + "_bottom", bottomZ);
-      if (layerRec) {
-        viaBottom.layerId = layerRec->layerId;
+  // Iterate DRC marker categories
+  for (auto cat : block->getMarkerCategories()) {
+    for (auto marker : cat->getMarkers()) {
+      odb::dbTechLayer* techLayer = marker->getTechLayer();
+      odb::Rect rect = marker->getBBox();
+
+      viewer3d::domain::ObjectRecord obj;
+      obj.objectId = generateObjectId("drc");
+      obj.type = viewer3d::domain::ObjectType::Drc;
+      obj.displayName = marker->getName();
+
+      float zBase = techLayer ? getLayerZBase(techLayer) : 0.5f;
+      float thickness = techLayer ? getLayerThickness(techLayer, db_units_per_micron_) : 0.1f;
+
+      obj.hasBbox = true;
+      obj.bboxMin[0] = dbuToMicrons(rect.xMin());
+      obj.bboxMin[1] = dbuToMicrons(rect.yMin());
+      obj.bboxMin[2] = zBase - thickness*0.5f;
+      obj.bboxMax[0] = dbuToMicrons(rect.xMax());
+      obj.bboxMax[1] = dbuToMicrons(rect.yMax());
+      obj.bboxMax[2] = zBase + thickness*0.5f;
+
+      float cx = (obj.bboxMin[0]+obj.bboxMax[0])*0.5f;
+      float cy = (obj.bboxMin[1]+obj.bboxMax[1])*0.5f;
+      float cz = (obj.bboxMin[2]+obj.bboxMax[2])*0.5f;
+      obj.transform = {1,0,0,0, 0,1,0,0, 0,0,1,0, cx,cy,cz,1};
+
+      if (techLayer) {
+        std::string layerName = techLayer->getName();
+        viewer3d::domain::LayerRecord* layer = getOrCreateLayer(snapshot, layerName, zBase);
+        if (layer) obj.layerId = layer->layerId;
       }
-      snapshot.objects.push_back(viaBottom);
-    }
-
-    // Create via_cut object (the cut layer between metals)
-    {
-      viewer3d::domain::ObjectRecord viaCut;
-      viaCut.objectId = generateObjectId("via_cut");
-      viaCut.type = viewer3d::domain::ObjectType::Via;
-      viaCut.displayName = via->getName() + "_" + viaLayerName + "_cut";
-      viaCut.styleRef = "via_cut";
-
-      viaCut.hasBbox = true;
-      viaCut.bboxMin[0] = dbuToMicrons(rect.xMin());
-      viaCut.bboxMin[1] = dbuToMicrons(rect.yMin());
-      viaCut.bboxMin[2] = viaZ;
-      viaCut.bboxMax[0] = dbuToMicrons(rect.xMax());
-      viaCut.bboxMax[1] = dbuToMicrons(rect.yMax());
-      viaCut.bboxMax[2] = viaZ + 0.05f;  // Very thin cut layer
-
-      float centerX = (viaCut.bboxMin[0] + viaCut.bboxMax[0]) * 0.5f;
-      float centerY = (viaCut.bboxMin[1] + viaCut.bboxMax[1]) * 0.5f;
-      float centerZ = (viaCut.bboxMin[2] + viaCut.bboxMax[2]) * 0.5f;
-      viaCut.transform = {1.0f, 0.0f, 0.0f, 0.0f,
-                          0.0f, 1.0f, 0.0f, 0.0f,
-                          0.0f, 0.0f, 1.0f, 0.0f,
-                          centerX, centerY, centerZ, 1.0f};
-
-      viewer3d::domain::LayerRecord* layerRec
-          = getOrCreateLayer(snapshot, viaLayerName + "_cut", viaZ);
-      if (layerRec) {
-        viaCut.layerId = layerRec->layerId;
-      }
-      snapshot.objects.push_back(viaCut);
+      snapshot.objects.push_back(obj);
     }
   }
+}
+
+void OdbSceneBuilder::processTrackGrids(viewer3d::domain::SceneSnapshot& snapshot) {
+  odb::dbChip* chip = db_ ? db_->getChip() : nullptr;
+  if (!chip) return;
+  odb::dbBlock* block = chip->getBlock();
+  if (!block) return;
+
+  // Ensure layer z positions cache is populated
+  computeLayerZPositions(db_->getTech(), db_units_per_micron_);
+
+  // Get actual die area from block bounding box
+  int dieMinX = 0, dieMinY = 0, dieMaxX = 0, dieMaxY = 0;
+  if (odb::dbBox* blockBBox = block->getBBox()) {
+    odb::Rect dieRect = blockBBox->getBox();
+    dieMinX = dieRect.xMin();
+    dieMinY = dieRect.yMin();
+    dieMaxX = dieRect.xMax();
+    dieMaxY = dieRect.yMax();
+  }
+
+  const float dieMinXF = dbuToMicrons(dieMinX);
+  const float dieMinYF = dbuToMicrons(dieMinY);
+  const float dieMaxXF = dbuToMicrons(dieMaxX);
+  const float dieMaxYF = dbuToMicrons(dieMaxY);
+
+  for (auto tg : block->getTrackGrids()) {
+    odb::dbTechLayer* techLayer = tg->getTechLayer();
+    if (!techLayer) continue;
+    float zBase = getLayerZBase(techLayer);
+    float thickness = getLayerThickness(techLayer, db_units_per_micron_);
+
+    std::vector<int> xGrid, yGrid;
+    tg->getGridX(xGrid);
+    tg->getGridY(yGrid);
+
+    // Build semicolon-separated line segments from track coordinates.
+    // Each segment is "x1,y1;x2,y2" defining one line.
+    // X tracks: vertical lines at each x coordinate.
+    // Y tracks: horizontal lines at each y coordinate.
+    // Use actual die area boundaries.
+    std::ostringstream polyDesc;
+    bool first = true;
+    for (int x : xGrid) {
+      float fx = dbuToMicrons(x);
+      if (!first) polyDesc << ";";
+      polyDesc << fx << "," << dieMinYF << ";" << fx << "," << dieMaxYF;
+      first = false;
+    }
+    for (int y : yGrid) {
+      float fy = dbuToMicrons(y);
+      if (!first) polyDesc << ";";
+      polyDesc << dieMinXF << "," << fy << ";" << dieMaxXF << "," << fy;
+      first = false;
+    }
+
+    viewer3d::domain::ObjectRecord obj;
+    obj.objectId = generateObjectId("track");
+    obj.type = viewer3d::domain::ObjectType::Track;
+    obj.displayName = std::string("track_") + techLayer->getName();
+    if (!polyDesc.str().empty()) {
+      obj.geometryRef = "poly:" + polyDesc.str();
+    }
+    obj.hasBbox = true;
+    // Track is a line without thickness, so z should be a single value (layer center)
+    obj.bboxMin[0] = dieMinXF;
+    obj.bboxMin[1] = dieMinYF;
+    obj.bboxMin[2] = zBase;
+    obj.bboxMax[0] = dieMaxXF;
+    obj.bboxMax[1] = dieMaxYF;
+    obj.bboxMax[2] = zBase;
+
+    float cx = (obj.bboxMin[0] + obj.bboxMax[0]) * 0.5f;
+    float cy = (obj.bboxMin[1] + obj.bboxMax[1]) * 0.5f;
+    float cz = (obj.bboxMin[2] + obj.bboxMax[2]) * 0.5f;
+    obj.transform = {1.0f, 0.0f, 0.0f, 0.0f,
+                     0.0f, 1.0f, 0.0f, 0.0f,
+                     0.0f, 0.0f, 1.0f, 0.0f,
+                     cx, cy, cz, 1.0f};
+
+    std::string layerName = techLayer->getName();
+    viewer3d::domain::LayerRecord* layer = getOrCreateLayer(snapshot, layerName, zBase);
+    if (layer) obj.layerId = layer->layerId;
+    snapshot.objects.push_back(obj);
+  }
+  DEBUG_PRINT("DEBUG: processed %u track grids\n", (unsigned)block->getTrackGrids().size());
 }
 
 viewer3d::domain::SceneSnapshot OdbSceneBuilder::build() {
   viewer3d::domain::SceneSnapshot snapshot;
   snapshot.sourceTag = "openroad_db";
 
+  // Clear layer lookup map at start of build
+  layerLookupMap.clear();
+
   if (!db_) {
     return snapshot;
+  }
+
+  // Reserve capacity for objects and layers based on block statistics
+  if (odb::dbChip* chip = db_->getChip()) {
+    if (odb::dbBlock* block = chip->getBlock()) {
+      // Estimate: each net can have multiple wire shapes, each shape creates 1-3 objects (wire/via_top/via_bottom/via_cut)
+      int netCount = block->getNets().size();
+      int instCount = block->getInsts().size();
+      int btermCount = block->getBTerms().size();
+      int viaCount = block->getVias().size();
+      int trackGridCount = block->getTrackGrids().size();
+
+      // Reserve for objects: estimate ~5 objects per net on average, plus insts, pins, tracks
+      int estimatedObjects = netCount * 5 + instCount * 1 + btermCount * 2 + trackGridCount * 1 + viaCount * 3;
+      snapshot.objects.reserve(estimatedObjects);
+
+      // Reserve for layers: typically < 50 unique layers
+      snapshot.layers.reserve(50);
+    }
   }
 
   processInstances(snapshot);
@@ -1059,12 +1186,12 @@ viewer3d::domain::SceneSnapshot OdbSceneBuilder::build() {
   processPins(snapshot);
   // Note: processVias removed - actual via instances come from wire iteration in processNets
   // Block vias (library definitions) don't have instance location info
+  processBlockages(snapshot);
+  processDrcMarkers(snapshot);
+  processTrackGrids(snapshot);
 
-  // Debug: print all layers BEFORE deduplication
-  fprintf(stderr, "DEBUG: Layers before dedup (%zu):\n", snapshot.layers.size());
-  for (const auto& layer : snapshot.layers) {
-    fprintf(stderr, "  - %s (zBase=%.2f)\n", layer.name.c_str(), layer.zBase);
-  }
+  DEBUG_PRINT("DEBUG OdbSceneBuilder: built %zu objects, %zu layers\n",
+          snapshot.objects.size(), snapshot.layers.size());
 
   // Deduplicate layers by name, keeping the first occurrence
   std::vector<viewer3d::domain::LayerRecord> uniqueLayers;

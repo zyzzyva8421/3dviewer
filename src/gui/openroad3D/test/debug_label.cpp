@@ -32,9 +32,11 @@
 using namespace viewer3d::domain;
 using namespace viewer3d::render::backend_osg;
 
-static void dumpNode(osg::Node* node, int depth = 0);
+static const char* pass_fail(bool ok) {
+    return ok ? "PASS" : "FAIL";
+}
 
-static void dumpLabelNode(osg::Node* node, int depth = 0) {
+static void dumpNode(osg::Node* node, int depth = 0) {
     if (!node) return;
     const std::string indent(depth * 2, ' ');
 
@@ -52,14 +54,6 @@ static void dumpLabelNode(osg::Node* node, int depth = 0) {
         fprintf(stderr, "%s  scale=(%.4f, %.4f, %.4f)\n", indent.c_str(), s.x(), s.y(), s.z());
         fprintf(stderr, "%s  rotate=(%.2fdeg around [%.2f, %.2f, %.2f])\n",
                 indent.c_str(), ra * 180.0 / M_PI, rx, ry, rz);
-
-        // Dump matrix row by row
-        fprintf(stderr, "%s  matrix:\n", indent.c_str());
-        for (int row = 0; row < 4; ++row) {
-            fprintf(stderr, "%s    [%.4f  %.4f  %.4f  %.4f]\n",
-                    indent.c_str(),
-                    mat(row, 0), mat(row, 1), mat(row, 2), mat(row, 3));
-        }
     }
 
     osg::Geode* geode = dynamic_cast<osg::Geode*>(node);
@@ -71,43 +65,8 @@ static void dumpLabelNode(osg::Node* node, int depth = 0) {
     osg::Group* group = node->asGroup();
     if (group) {
         for (unsigned int i = 0; i < group->getNumChildren(); ++i) {
-            dumpLabelNode(group->getChild(i), depth + 1);
+            dumpNode(group->getChild(i), depth + 1);
         }
-    }
-}
-
-static void verifyLabelPlacement(osg::Node* node,
-                                   float expectedSurfaceZ,
-                                   float expectedOffset,
-                                   const char* labelName) {
-    osg::MatrixTransform* mt = dynamic_cast<osg::MatrixTransform*>(node);
-    if (!mt) return;
-
-    std::string name = node->getName();
-    if (name.find("labelXform:") == std::string::npos) return;
-
-    osg::Matrixd mat = mt->getMatrix();
-    osg::Vec3d t = mat.getTrans();
-    osg::Vec3d s = mat.getScale();
-
-    float worldZ = t.z();
-    float scale = s.z();
-
-    fprintf(stderr, "\n=== Label Verification: %s ===\n", labelName);
-    fprintf(stderr, "  Surface z: %.4f\n", expectedSurfaceZ);
-    fprintf(stderr, "  Label local z: %.4f\n", t.z());
-    fprintf(stderr, "  Label scale: %.4f\n", scale);
-    fprintf(stderr, "  Text height at scale: %.4f\n", scale * 0.8f);  // charSize=0.8
-    fprintf(stderr, "  Expected gap: %.4f\n", expectedOffset);
-    fprintf(stderr, "  Actual distance from surface: %.4f\n", worldZ - expectedSurfaceZ);
-
-    // Check if label is close to surface (within tolerance)
-    float tolerance = 0.05f;
-    float distanceFromSurface = worldZ - expectedSurfaceZ;
-    if (distanceFromSurface < 0 || distanceFromSurface > expectedOffset + tolerance) {
-        fprintf(stderr, "  WARNING: Label may not be properly attached to surface!\n");
-    } else {
-        fprintf(stderr, "  OK: Label appears to be properly positioned\n");
     }
 }
 
@@ -115,89 +74,234 @@ int main() {
     // Create a scene with font
     OsgScene scene;
 
-    // Simulate a typical M1 wire: 0.2 wide, 5 long, 0.13 thick
-    // centered at (10, 20) in the XY plane
-    ObjectRecord wire;
-    wire.objectId = "test_wire";
-    wire.type = ObjectType::Wire;
-    wire.displayName = "wire_NET1";
-    wire.hasBbox = true;
-    wire.layerId = "metal1";
+    int totalTests = 0;
+    int passedTests = 0;
 
-    // Wire from (9.9, 10) to (10.1, 15), thickness 0.13
-    wire.bboxMin = {9.9f, 10.0f, 0.0f};
-    wire.bboxMax = {10.1f, 15.0f, 0.13f};
+    // =========================================================================
+    // Test 1: Vertical wire (Y longest) - text on Front/Back (Z) and Right/Left (X)
+    // =========================================================================
+    {
+        fprintf(stderr, "\n============================================================\n");
+        fprintf(stderr, "TEST 1: Vertical wire (ylen > xlen, ylen > zlen)\n");
+        fprintf(stderr, "============================================================\n");
 
-    // Transform at center of bbox
-    float cx = (wire.bboxMin[0] + wire.bboxMax[0]) * 0.5f;  // 10.0
-    float cy = (wire.bboxMin[1] + wire.bboxMax[1]) * 0.5f;  // 12.5
-    float cz = (wire.bboxMin[2] + wire.bboxMax[2]) * 0.5f;  // 0.065
-    wire.transform = {1,0,0,0, 0,1,0,0, 0,0,1,0, cx,cy,cz,1};
+        ObjectRecord wire;
+        wire.objectId = "vertical_wire";
+        wire.type = ObjectType::Wire;
+        wire.displayName = "wire_VNET";
+        wire.hasBbox = true;
+        wire.layerId = "metal1";
 
-    fprintf(stderr, "=== Wire bbox: [%.2f, %.2f, %.2f] -> [%.2f, %.2f, %.2f]\n",
-            wire.bboxMin[0], wire.bboxMin[1], wire.bboxMin[2],
-            wire.bboxMax[0], wire.bboxMax[1], wire.bboxMax[2]);
-    fprintf(stderr, "=== Transform center: (%.2f, %.2f, %.2f)\n", cx, cy, cz);
-    fprintf(stderr, "=== dims: x=%.2f y=%.2f z=%.2f\n",
-            wire.bboxMax[0]-wire.bboxMin[0],
-            wire.bboxMax[1]-wire.bboxMin[1],
-            wire.bboxMax[2]-wire.bboxMin[2]);
+        // Wire: x from 9.9 to 10.1 (xlen=0.2), y from 10 to 15 (ylen=5), z from 0 to 0.13 (zlen=0.13)
+        wire.bboxMin = {9.9f, 10.0f, 0.0f};
+        wire.bboxMax = {10.1f, 15.0f, 0.13f};
 
-    // Add metal1 layer
-    LayerRecord layer;
-    layer.layerId = "metal1";
-    layer.name = "metal1";
-    layer.zBase = 0.065f;
-    layer.thickness = 0.13f;
-    layer.visible = true;
-    layer.selectable = true;
-    layer.color = {0.9f, 0.2f, 0.2f, 1.0f};
-    scene.updateLayer(layer);
+        float cx = (wire.bboxMin[0] + wire.bboxMax[0]) * 0.5f;  // 10.0
+        float cy = (wire.bboxMin[1] + wire.bboxMax[1]) * 0.5f;  // 12.5
+        float cz = (wire.bboxMin[2] + wire.bboxMax[2]) * 0.5f;  // 0.065
+        wire.transform = {1,0,0,0, 0,1,0,0, 0,0,1,0, cx,cy,cz,1};
 
-    // Create the scene object with label
-    OsgSceneObject* sceneObj = scene.createSceneObject(wire, scene.getLayer("metal1"));
-    scene.addObject(sceneObj);
+        LayerRecord layer;
+        layer.layerId = "metal1";
+        layer.name = "metal1";
+        layer.zBase = 0.065f;
+        layer.thickness = 0.13f;
+        layer.visible = true;
+        layer.selectable = true;
+        layer.color = {0.9f, 0.2f, 0.2f, 1.0f};
+        scene.updateLayer(layer);
 
-    // Enable display names
-    scene.setDisplayNamesVisible(true);
+        OsgSceneObject* sceneObj = scene.createSceneObject(wire, scene.getLayer("metal1"));
+        scene.addObject(sceneObj);
+        scene.setDisplayNamesVisible(true);
 
-    // Dump the scene graph
-    fprintf(stderr, "\n=== Scene Graph Dump ===\n");
-    osg::Group* root = scene.getObjectRoot();
-    if (root) {
-        fprintf(stderr, "[Root] children=%u\n", root->getNumChildren());
-        for (unsigned int i = 0; i < root->getNumChildren(); ++i) {
-            dumpLabelNode(root->getChild(i));
+        // Dump scene graph
+        osg::Group* root = scene.getObjectRoot();
+        if (root) {
+            for (unsigned int i = 0; i < root->getNumChildren(); ++i) {
+                dumpNode(root->getChild(i));
+            }
         }
-    }
 
-    // Verify label placement
-    fprintf(stderr, "\n=== Label Placement Verification ===\n");
+        // Find label transforms
+        osg::MatrixTransform* wireMT = nullptr;
+        for (unsigned int i = 0; i < root->getNumChildren(); ++i) {
+            if (root->getChild(i)->getName() == "vertical_wire") {
+                wireMT = dynamic_cast<osg::MatrixTransform*>(root->getChild(i));
+                break;
+            }
+        }
 
-    // Wire is at z=0.065, with thickness 0.13, so front surface is at z=0.13
-    float wireFrontSurfaceZ = 0.13f;
-    float expectedOffset = 0.016f;  // charSize * 0.02 = 0.8 * 0.02
+        if (!wireMT) {
+            fprintf(stderr, "FAIL: vertical_wire not found in scene\n");
+        } else {
+            // Search for label transforms through LOD
+            osg::Group* wireGroup = wireMT->asGroup();
+            osg::Group* labelsGroup = nullptr;
+            for (unsigned int i = 0; i < wireGroup->getNumChildren(); ++i) {
+                osg::Node* child = wireGroup->getChild(i);
+                if (child->getName().find(":labels") != std::string::npos) {
+                    labelsGroup = child->asGroup();
+                    break;
+                }
+            }
 
-    // Find the wire node and its labels
-    for (unsigned int i = 0; i < root->getNumChildren(); ++i) {
-        osg::Node* child = root->getChild(i);
-        osg::MatrixTransform* mt = dynamic_cast<osg::MatrixTransform*>(child);
-        if (mt && child->getName() == "test_wire") {
-            osg::Group* wireGroup = mt->asGroup();
-            if (wireGroup) {
-                for (unsigned int j = 0; j < wireGroup->getNumChildren(); ++j) {
-                    osg::Node* labelNode = wireGroup->getChild(j);
-                    if (labelNode->getName().find("labelXform:") != std::string::npos) {
-                        verifyLabelPlacement(labelNode, wireFrontSurfaceZ, expectedOffset, "wire_NET1");
+            if (!labelsGroup) {
+                fprintf(stderr, "FAIL: labels not found for vertical_wire\n");
+            } else {
+                // LOD has one child: the label group
+                osg::Group* innerGroup = nullptr;
+                for (unsigned int i = 0; i < labelsGroup->getNumChildren(); ++i) {
+                    if (labelsGroup->getChild(i)->asGroup()) {
+                        innerGroup = labelsGroup->getChild(i)->asGroup();
+                        break;
+                    }
+                }
+
+                if (innerGroup) {
+                    float zlen = 0.13f;
+                    float expectedFrontZ = 0.0f;          // at front surface
+                    float expectedBackZ = zlen;            // at back surface
+                    float expectedZCenter = zlen * 0.5f;  // zlen/2 (for R/L faces)
+
+                    for (unsigned int j = 0; j < innerGroup->getNumChildren(); ++j) {
+                        osg::Node* labelNode = innerGroup->getChild(j);
+                        if (labelNode->getName().find("labelXform:") == std::string::npos) continue;
+
+                        osg::MatrixTransform* mt = dynamic_cast<osg::MatrixTransform*>(labelNode);
+                        if (!mt) continue;
+
+                        osg::Vec3d t = mt->getMatrix().getTrans();
+                        // Local Z should be one of: -offset, zlen+offset, or zlen/2
+                        bool isFrontLike = (std::abs(t.z() - expectedFrontZ) < 0.001f);
+                        bool isBackLike = (std::abs(t.z() - expectedBackZ) < 0.001f);
+                        bool isCenterLike = (std::abs(t.z() - expectedZCenter) < 0.001f);
+
+                        fprintf(stderr, "  Label '%s' local Z=%.4f: front=%d back=%d center=%d\n",
+                                labelNode->getName().c_str(), t.z(), isFrontLike, isBackLike, isCenterLike);
+
+                        totalTests++;
+                        if (isFrontLike || isBackLike || isCenterLike) {
+                            passedTests++;
+                        } else {
+                            fprintf(stderr, "  FAIL: unexpected Z position\n");
+                        }
                     }
                 }
             }
         }
+
+        scene.removeObject(sceneObj);
     }
 
-    // Now delete the scene object and clean up
-    scene.removeObject(sceneObj);
+    // =========================================================================
+    // Test 2: Horizontal wire (X longest) - text on Front/Back (Z) and Top/Bottom (Y)
+    // =========================================================================
+    {
+        fprintf(stderr, "\n============================================================\n");
+        fprintf(stderr, "TEST 2: Horizontal wire (xlen > ylen, xlen > zlen)\n");
+        fprintf(stderr, "============================================================\n");
 
-    fprintf(stderr, "\n=== DONE ===\n");
+        ObjectRecord wire;
+        wire.objectId = "horizontal_wire";
+        wire.type = ObjectType::Wire;
+        wire.displayName = "wire_HNET";
+        wire.hasBbox = true;
+        wire.layerId = "metal1";
+
+        // Wire: x from 0 to 20 (xlen=20), y from 5 to 5.2 (ylen=0.2), z from 0 to 0.13 (zlen=0.13)
+        wire.bboxMin = {0.0f, 5.0f, 0.0f};
+        wire.bboxMax = {20.0f, 5.2f, 0.13f};
+
+        float cx = (wire.bboxMin[0] + wire.bboxMax[0]) * 0.5f;  // 10.0
+        float cy = (wire.bboxMin[1] + wire.bboxMax[1]) * 0.5f;  // 5.1
+        float cz = (wire.bboxMin[2] + wire.bboxMax[2]) * 0.5f;  // 0.065
+        wire.transform = {1,0,0,0, 0,1,0,0, 0,0,1,0, cx,cy,cz,1};
+
+        OsgSceneObject* sceneObj = scene.createSceneObject(wire, scene.getLayer("metal1"));
+        scene.addObject(sceneObj);
+        scene.setDisplayNamesVisible(true);
+
+        osg::Group* root = scene.getObjectRoot();
+
+        osg::MatrixTransform* wireMT = nullptr;
+        for (unsigned int i = 0; i < root->getNumChildren(); ++i) {
+            if (root->getChild(i)->getName() == "horizontal_wire") {
+                wireMT = dynamic_cast<osg::MatrixTransform*>(root->getChild(i));
+                break;
+            }
+        }
+
+        if (!wireMT) {
+            fprintf(stderr, "FAIL: horizontal_wire not found\n");
+        } else {
+            osg::Group* wireGroup = wireMT->asGroup();
+            osg::Group* labelsGroup = nullptr;
+            for (unsigned int i = 0; i < wireGroup->getNumChildren(); ++i) {
+                if (wireGroup->getChild(i)->getName().find(":labels") != std::string::npos) {
+                    labelsGroup = wireGroup->getChild(i)->asGroup();
+                    break;
+                }
+            }
+
+            if (!labelsGroup) {
+                fprintf(stderr, "FAIL: labels not found for horizontal_wire\n");
+            } else {
+                osg::Group* innerGroup = nullptr;
+                for (unsigned int i = 0; i < labelsGroup->getNumChildren(); ++i) {
+                    if (labelsGroup->getChild(i)->asGroup()) {
+                        innerGroup = labelsGroup->getChild(i)->asGroup();
+                        break;
+                    }
+                }
+
+                if (innerGroup) {
+                    float zlen = 0.13f;
+                    float expectedFrontZ = 0.0f;
+                    float expectedBackZ = zlen;
+                    float expectedZCenter = zlen * 0.5f;
+
+                    for (unsigned int j = 0; j < innerGroup->getNumChildren(); ++j) {
+                        osg::Node* labelNode = innerGroup->getChild(j);
+                        if (labelNode->getName().find("labelXform:") == std::string::npos) continue;
+
+                        osg::MatrixTransform* mt = dynamic_cast<osg::MatrixTransform*>(labelNode);
+                        if (!mt) continue;
+
+                        osg::Vec3d t = mt->getMatrix().getTrans();
+                        bool isFrontLike = (std::abs(t.z() - expectedFrontZ) < 0.001f);
+                        bool isBackLike = (std::abs(t.z() - expectedBackZ) < 0.001f);
+                        bool isCenterLike = (std::abs(t.z() - expectedZCenter) < 0.001f);
+
+                        fprintf(stderr, "  Label '%s' local Z=%.4f: front=%d back=%d center=%d\n",
+                                labelNode->getName().c_str(), t.z(), isFrontLike, isBackLike, isCenterLike);
+
+                        totalTests++;
+                        if (isFrontLike || isBackLike || isCenterLike) {
+                            passedTests++;
+                        } else {
+                            fprintf(stderr, "  FAIL: unexpected Z position\n");
+                        }
+                    }
+                }
+            }
+        }
+
+        scene.removeObject(sceneObj);
+    }
+
+    // =========================================================================
+    // Summary
+    // =========================================================================
+    fprintf(stderr, "\n============================================================\n");
+    fprintf(stderr, "RESULTS: %d/%d tests passed\n", passedTests, totalTests);
+    fprintf(stderr, "============================================================\n");
+
+    if (totalTests == 0 || passedTests != totalTests) {
+        fprintf(stderr, "SOME TESTS FAILED\n");
+        return 1;
+    }
+
+    fprintf(stderr, "ALL TESTS PASSED\n");
     return 0;
 }

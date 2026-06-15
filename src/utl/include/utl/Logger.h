@@ -78,8 +78,10 @@ class Progress;
   X(TAP)                \
   X(TST)                \
   X(UKN)                \
+  X(XGP)                \
   X(UPF)                \
-  X(UTL)
+  X(UTL)                \
+  X(XDP)
 
 #define GENERATE_ENUM(ENUM) ENUM,
 #define GENERATE_STRING(STRING) #STRING,

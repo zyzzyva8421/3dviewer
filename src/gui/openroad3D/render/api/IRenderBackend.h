@@ -242,7 +242,25 @@ class IRenderBackend {
    * @brief Query whether display names are visible.
    * @return true if names are visible
    */
-  virtual bool isDisplayNamesVisible() const = 0;};
+  virtual bool isDisplayNamesVisible() const = 0;
+
+  /**
+   * @brief Show/hide stipple surface patterns on objects.
+   * @param visible true to show stipple, false to hide
+   */
+  virtual void setStippleVisible(bool visible) = 0;
+
+  /**
+   * @brief Query whether stipple patterns are visible.
+   * @return true if stipple is visible
+   */
+  virtual bool isStippleVisible() const = 0;
+
+  virtual void setObjectVisible(const std::string& objectId, bool visible) = 0;
+  virtual bool isObjectVisible(const std::string& objectId) const = 0;
+  virtual std::string objectIdAtScreen(float nx, float ny) const = 0;
+  virtual void setHeightScale(float scale) = 0;
+  virtual float heightScale() const = 0;};
 
 // English comment.
 

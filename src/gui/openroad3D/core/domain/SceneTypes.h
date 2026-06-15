@@ -42,6 +42,7 @@ struct LayerRecord {
   float thickness = 0.0F;
   bool visible = true;
   bool selectable = true;
+  bool isHorizontal = true;   // from dbTechLayerDir: HORIZONTAL=true, VERTICAL=false
   ColorRgba color;
   std::string stippleId;
   float transparency = 0.0F;
@@ -67,6 +68,10 @@ struct ObjectRecord {
   std::string geometryRef;
   std::string styleRef;
   std::string displayName;
+  // Wire direction: for Wire objects, this comes from bbox (xlen vs ylen).
+  // For other objects, this defaults to true and can be overridden by layer direction.
+  // Used by attachObjectLabels() to orient text along wire direction.
+  bool isHorizontal = true;
 };
 
 struct CaseRecord {

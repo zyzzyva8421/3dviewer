@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <osg/ref_ptr>
 #include <osg/Object>
@@ -28,6 +29,7 @@ class Geometry;
 class Material;
 class Light;
 class Texture2D;
+class LOD;
 }
 
 namespace viewer3d {
@@ -165,6 +167,17 @@ public:
     void setDisplayNamesVisible(bool visible);
     bool isDisplayNamesVisible() const { return displayNamesVisible_; }
 
+    // Stipple surface pattern control
+    void setStippleVisible(bool visible);
+    bool isStippleVisible() const { return stippleVisible_; }
+
+    // Object hide/show
+    void setObjectVisible(const std::string& objectId, bool visible);
+    bool isObjectVisible(const std::string& objectId) const;
+
+    // Find object info from screen coords (for tooltips)
+    std::string findObjectIdAtScreen(float nx, float ny) const;
+
 private:
     osg::ref_ptr<osg::Group> objectRoot_;
     osg::ref_ptr<osg::Switch> highlightRoot_;
@@ -177,18 +190,29 @@ private:
     
     // Name label display state
     bool displayNamesVisible_ = false;
+    bool stippleVisible_ = false;
     std::unordered_map<std::string, osg::ref_ptr<osg::Group>> textLabelNodes_;
-    std::unordered_map<std::string, domain::ObjectRecord> objectRecordsById_;
+    // Stipple LOD nodes (tracked separately for efficient toggle)
+    std::unordered_map<std::string, osg::ref_ptr<osg::LOD>> stippleNodes_;
+    // Pointer to ObjectRecord (avoids copying the 64-byte transform array)
+    std::unordered_map<std::string, const domain::ObjectRecord*> objectRecordPtrs_;
     
     // Font atlas for text rendering (stb_truetype approach)
     std::unique_ptr<OsgFontAtlas> fontAtlas_;
-    
+
+    // Stipple texture cache: pattern name → RGBA texture
+    std::unordered_map<std::string, osg::ref_ptr<osg::Texture2D>> stippleTextures_;
+
+    // Hidden objects (excluded from selection + visibility)
+    std::unordered_set<std::string> hiddenObjects_;
+
     std::vector<osg::ref_ptr<osg::Light>> lights_;
     osg::ref_ptr<osg::Light> mainLight_;
-    
+
     osg::ref_ptr<osg::Texture2D> defaultTexture_;
-    
+
     void applyStipple(osg::StateSet* stateset, domain::LineStyle lineStyle, const std::string& stippleId);
+    osg::Texture2D* getOrCreateStippleTexture(const std::string& name);
     void attachObjectGeometry(osg::Geode* geode,
                               const domain::ObjectRecord& obj,
                               const domain::LayerRecord* layer);
@@ -197,6 +221,7 @@ private:
                                    domain::ObjectType objectType);
     osg::Geometry* createBoxGeometry(float x, float y, float width, float height, float depth);
     osg::Geometry* createPolylineGeometry(const domain::ObjectRecord& obj, const domain::LayerRecord* layer, float xOffset = 0.0f, float yOffset = 0.0f);
+    osg::Geometry* createPolygonGeometry(const std::vector<osg::Vec2>& points, float thickness);
     osg::Geometry* createPointGeometry(float size);
     void applyGlowMaterial(osg::Node* node);
     void restoreObjectMaterial(osg::Node* node);
@@ -204,6 +229,9 @@ private:
     
     // Initialize font atlas (tries common system paths)
     bool initFontAtlas();
+    
+    // Debug: create XYZ coordinate axes at origin
+    void createCoordinateAxes();
 
     // Label face orientation (glview-style)
     enum class LabelFace { Front, Back, Right, Left, Top, Bottom };
@@ -211,6 +239,11 @@ private:
     // Name label helpers (glview-style text on faces)
     void attachObjectLabels(osg::MatrixTransform* transform, const domain::ObjectRecord& obj, const domain::LayerRecord* layer);
     void removeObjectLabels(const std::string& objectId);
+    osg::Node* makeStippleFaceQuad(float cx, float cy, float cz,
+                                    float halfW, float halfH,
+                                    int dim1, int dim2,
+                                    const osg::Vec4& color,
+                                    const std::string& stippleId);
     osg::Node* makeTextGeodeForFace(const std::string& text,
                                     float centerX,
                                     float centerY,
@@ -218,7 +251,13 @@ private:
                                     float charSize,
                                     const osg::Vec4& color,
                                     const osg::Quat& rotation);
+
+    // DEBUG: colored marker box at text position for visual verification
+    osg::Node* makeMarkerBox(float cx, float cy, float cz,
+                             const osg::Vec4& color,
+                             const osg::Quat& rotation);
     osg::Quat computeFaceRotation(LabelFace face,
+                                  bool textAlongX,
                                   float xlen,
                                   float ylen,
                                   float zlen) const;

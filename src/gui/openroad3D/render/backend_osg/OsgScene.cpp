@@ -32,8 +32,12 @@
 #include <osg/ShadeModel>
 #include <osg/LineStipple>
 #include <osg/CullFace>
+#include <osg/Depth>
 #include <osg/LOD>
 #include <osg/PolygonOffset>
+#include <osg/TexGen>
+#include <osg/TexEnv>
+#include <osg/LineWidth>
 #include <osgDB/ReaderWriter>
 #include <osgDB/ReadFile>
 #include <osgUtil/IntersectVisitor>
@@ -126,6 +130,131 @@ void applyFlatColor(osg::Geometry* geometry, const osg::Vec4& color) {
 }
 
 }  // namespace
+
+// ===========================================================================
+// Stipple pattern data (from hi/win/winLayer.c)
+// Each pattern is a mono bitmap: bit=1 → dark pixel, bit=0 → transparent.
+// ===========================================================================
+namespace {
+
+struct StippleDef {
+    const char* name;
+    int width;
+    int height;
+    const char* hexData;  // space-separated hex bytes
+};
+
+static const StippleDef kStippleDefs[] = {
+    {"horizontal", 8, 4,  "0x00 0x00 0x00 0xff"},
+    {"vertical",   8, 4,  "0x11 0x11 0x11 0x11"},
+    {"grid",       8, 4,  "0x11 0x11 0x11 0xff"},
+    {"slash",      8, 8,  "0x80 0x40 0x20 0x10 0x08 0x04 0x02 0x01"},
+    {"backslash",  8, 8,  "0x01 0x02 0x04 0x08 0x10 0x20 0x40 0x80"},
+    {"cross",      8, 8,  "0x81 0x42 0x24 0x18 0x18 0x24 0x42 0x81"},
+    {"brick",     16, 8,  "0xff 0xff 0x40 0x40 0x40 0x40 0x40 0x40 0xff 0xff 0x04 0x04 0x04 0x04 0x04 0x04"},
+    {"dot1",       8, 8,  "0x00 0x04 0x00 0x00 0x00 0x00 0x40 0x00"},
+    {"dot2",       8, 4,  "0x04 0x00 0x40 0x00"},
+    {"dot4",       8, 4,  "0x00 0x22 0x00 0x88"},
+    {"slash2",     8, 4,  "0x88 0x44 0x22 0x11"},
+    {"backslash2", 8, 4,  "0x11 0x22 0x44 0x88"},
+    {"dot8_1",     8, 4,  "0x84 0x21 0x48 0x12"},
+    {"dot8_2",     8, 4,  "0x12 0x48 0x21 0x84"},
+};
+
+static constexpr int kNumStippleDefs = sizeof(kStippleDefs) / sizeof(kStippleDefs[0]);
+
+// Convert hex string like "0x80 0x40 ..." to RGBA pixel data.
+// pattern bit=1 → dark pixel (R=G=B=80, A=255), bit=0 → white pixel (255,255,255,255)
+static std::unique_ptr<uint8_t[]> parseStippleData(const StippleDef& def) {
+    std::vector<uint8_t> bytes;
+    std::string data(def.hexData);
+    std::string token;
+    std::istringstream iss(data);
+    while (iss >> token) {
+        bytes.push_back(static_cast<uint8_t>(std::stoul(token, nullptr, 16)));
+    }
+
+    auto pixels = std::make_unique<uint8_t[]>(def.width * def.height * 4);
+    for (int row = 0; row < def.height; ++row) {
+        uint8_t byte = (row < (int)bytes.size()) ? bytes[row] : 0;
+        for (int col = 0; col < def.width; ++col) {
+            int bit = (byte >> (def.width - 1 - col)) & 1;
+            int idx = (row * def.width + col) * 4;
+            if (bit) {
+                pixels[idx + 0] = 80;    // R
+                pixels[idx + 1] = 80;    // G
+                pixels[idx + 2] = 80;    // B
+                pixels[idx + 3] = 255;   // A
+            } else {
+                pixels[idx + 0] = 255;   // R
+                pixels[idx + 1] = 255;   // G
+                pixels[idx + 2] = 255;   // B
+                pixels[idx + 3] = 255;   // A
+            }
+        }
+    }
+    return pixels;
+}
+
+// Map layer name hash to a deterministic stipple index.
+
+// Simple polygon triangulation (ear-clipping) for 2D polygons in the XY plane.
+// Returns triangle vertices as (x0,y0, x1,y1, x2,y2, ...).
+static std::vector<float> triangulatePolygon(const std::vector<osg::Vec2>& poly) {
+    std::vector<float> tris;
+    if (poly.size() < 3) return tris;
+
+    // Work on a copy of indices
+    std::vector<int> idx(poly.size());
+    for (int i = 0; i < (int)poly.size(); ++i) idx[i] = i;
+
+    auto prev = [&](int p) -> int { return (p == 0) ? (int)idx.size()-1 : p-1; };
+    auto next = [&](int p) -> int { return (p+1 >= (int)idx.size()) ? 0 : p+1; };
+
+    auto isEar = [&](int p) -> bool {
+        int a = prev(p), b = p, c = next(p);
+        osg::Vec2 va = poly[idx[a]], vb = poly[idx[b]], vc = poly[idx[c]];
+        // Compute signed area of triangle
+        float cross = (vb.x()-va.x())*(vc.y()-va.y()) - (vb.y()-va.y())*(vc.x()-va.x());
+        if (cross >= 0) return false;  // reflex or degenerate
+        // Check no other vertex is inside the triangle
+        for (int i = 0; i < (int)idx.size(); ++i) {
+            if (i == a || i == b || i == c) continue;
+            osg::Vec2 pt = poly[idx[i]];
+            // Barycentric check
+            float w0 = ((va.y()-vc.y())*(pt.x()-vc.x()) + (vc.x()-va.x())*(pt.y()-vc.y()))
+                     / ((va.y()-vc.y())*(vb.x()-vc.x()) + (vc.x()-va.x())*(vb.y()-vc.y()));
+            float w1 = ((vc.y()-va.y())*(pt.x()-va.x()) + (va.x()-vc.x())*(pt.y()-va.y()))
+                     / ((vc.y()-va.y())*(vb.x()-va.x()) + (va.x()-vc.x())*(vb.y()-va.y()));
+            float w2 = 1.0f - w0 - w1;
+            if (w0 > 0 && w1 > 0 && w2 > 0) return false;  // inside
+        }
+        return true;
+    };
+
+    int i = 0;
+    while (idx.size() > 3 && i < (int)idx.size() * 10) {
+        if (isEar(i)) {
+            int a = prev(i), b = i, c = next(i);
+            tris.push_back(poly[idx[a]].x()); tris.push_back(poly[idx[a]].y());
+            tris.push_back(poly[idx[b]].x()); tris.push_back(poly[idx[b]].y());
+            tris.push_back(poly[idx[c]].x()); tris.push_back(poly[idx[c]].y());
+            idx.erase(idx.begin() + i);
+            i = std::max(0, i-1);
+            continue;
+        }
+        i = (i+1) % idx.size();
+    }
+    // Last triangle
+    if (idx.size() == 3) {
+        tris.push_back(poly[idx[0]].x()); tris.push_back(poly[idx[0]].y());
+        tris.push_back(poly[idx[1]].x()); tris.push_back(poly[idx[1]].y());
+        tris.push_back(poly[idx[2]].x()); tris.push_back(poly[idx[2]].y());
+    }
+    return tris;
+}
+
+}  // anonymous namespace (stipple data + polygon helpers)
 
 // English comment.
 
@@ -410,10 +539,11 @@ void OsgScene::clear() {
     layers_.clear();
     highlightNodes_.clear();
     previousSelectedId_.clear();
-    
+
     // Clear name label state
     textLabelNodes_.clear();
-    objectRecordsById_.clear();
+    stippleNodes_.clear();
+    objectRecordPtrs_.clear();
 }
 
 size_t OsgScene::getObjectCount() const {
@@ -528,6 +658,11 @@ void OsgScene::getBoundingBox(Vec3& min, Vec3& max) const {
     osg::BoundingBox bbox;
     for (auto& node : objects_) {
         osg::BoundingSphere bs = node->getBound();
+        if (bs.radius() > 1000.0f || std::abs(bs.center().z()) > 50.0f) {
+            fprintf(stderr, "DEBUG hugeBound: node=%s center=(%.1f,%.1f,%.1f) radius=%.1f\n",
+                    node->getName().c_str(),
+                    bs.center().x(), bs.center().y(), bs.center().z(), bs.radius());
+        }
         bbox.expandBy(bs);
         if (isDebugLoggingEnabled()) {
             fprintf(stderr,
@@ -546,20 +681,51 @@ void OsgScene::getBoundingBox(Vec3& min, Vec3& max) const {
 
 void OsgScene::loadSnapshot(const domain::SceneSnapshot& snapshot) {
     clear();
-    
-    // English comment.
+
     for (const auto& layer : snapshot.layers) {
         layers_[layer.layerId] = layer;
     }
-    
-    // English comment.
+
+    // Debug mode: controlled by OPENROAD_3D_DEBUG env var
+    static const bool debugMode = []() {
+        const char* env = std::getenv("OPENROAD_3D_DEBUG");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+
+    // In debug mode: skip pins/insts, show 1 wire per metal layer, 1 via per cut layer.
+    std::unordered_map<std::string, int> wireCount;
+    std::unordered_map<std::string, int> cutCount;
+
     for (const auto& obj : snapshot.objects) {
+        if (debugMode) {
+            if (obj.type == domain::ObjectType::Pin) continue;
+            if (obj.type == domain::ObjectType::Inst) continue;
+            // Determine layer category from layerId
+            bool isMetal = obj.layerId.find("metal") != std::string::npos;
+            bool isCut = obj.layerId.find("cut") != std::string::npos
+                      || obj.layerId.find("via") != std::string::npos;
+            if (!isMetal && !isCut) continue;
+            if (obj.type == domain::ObjectType::Wire) {
+                if (!isMetal) continue;
+                auto& cnt = wireCount[obj.layerId];
+                if (cnt++ >= 1) continue;
+            }
+            if (obj.type == domain::ObjectType::Via) {
+                if (!isCut) continue;
+                auto& cnt = cutCount[obj.layerId];
+                if (cnt++ >= 1) continue;
+            }
+        }
+
         const domain::LayerRecord* layer = getLayer(obj.layerId);
         OsgSceneObject* sceneObj = createSceneObject(obj, layer);
         if (sceneObj) {
             addObject(sceneObj);
         }
     }
+
+    // Add XYZ coordinate axes at scene bounding box center
+    createCoordinateAxes();
 }
 
 void OsgScene::upsertObjects(const std::vector<domain::ObjectRecord>& objects) {
@@ -644,7 +810,8 @@ void OsgScene::removeObjectsById(const std::vector<std::string>& objectIds) {
         
         // Clean up name label state
         textLabelNodes_.erase(id);
-        objectRecordsById_.erase(id);
+        stippleNodes_.erase(id);
+        objectRecordPtrs_.erase(id);
     }
 }
 
@@ -828,31 +995,29 @@ OsgSceneObject* OsgScene::createSceneObject(const domain::ObjectRecord& obj, con
     }
     
     transform->addChild(geode);
-    
-    // Store object record for label recreation
-    objectRecordsById_[obj.objectId] = obj;
-    
+
+    // Store pointer to object record for label recreation (avoids copying 64-byte transform array)
+    objectRecordPtrs_[obj.objectId] = &obj;
+
     // Attach name labels if display is enabled
     if (displayNamesVisible_ && !obj.displayName.empty()) {
         attachObjectLabels(transform, obj, layer);
     }
-    
+
     return sceneObj;
 }
 
 void OsgScene::setDisplayNamesVisible(bool visible) {
-    fprintf(stderr, "DEBUG setDisplayNamesVisible: visible=%d displayNamesVisible_ was %d\n", visible, displayNamesVisible_);
     if (displayNamesVisible_ == visible) {
         return;
     }
     displayNamesVisible_ = visible;
-    
+
     if (visible) {
         // Rebuild labels for all existing objects
-        fprintf(stderr, "DEBUG setDisplayNamesVisible: rebuilding labels for %zu objects\n", objectRecordsById_.size());
-        for (const auto& pair : objectRecordsById_) {
+        for (const auto& pair : objectRecordPtrs_) {
             const std::string& objectId = pair.first;
-            const domain::ObjectRecord& obj = pair.second;
+            const domain::ObjectRecord* obj = pair.second;
             auto objIt = objectsById_.find(objectId);
             if (objIt == objectsById_.end()) {
                 continue;
@@ -865,9 +1030,9 @@ void OsgScene::setDisplayNamesVisible(bool visible) {
             if (!transform) {
                 continue;
             }
-            auto layerIt = layers_.find(obj.layerId);
+            auto layerIt = layers_.find(obj->layerId);
             const domain::LayerRecord* layer = (layerIt != layers_.end()) ? &layerIt->second : nullptr;
-            attachObjectLabels(transform, obj, layer);
+            attachObjectLabels(transform, *obj, layer);
         }
     } else {
         // Remove all label nodes
@@ -881,7 +1046,73 @@ void OsgScene::setDisplayNamesVisible(bool visible) {
             }
         }
         textLabelNodes_.clear();
+
+        // Also remove all stipple LOD nodes
+        for (auto& pair : stippleNodes_) {
+            osg::LOD* stippleLod = pair.second.get();
+            if (stippleLod) {
+                osg::Group* parent = stippleLod->getParent(0);
+                if (parent) {
+                    parent->removeChild(stippleLod);
+                }
+            }
+        }
+        stippleNodes_.clear();
     }
+}
+
+void OsgScene::setStippleVisible(bool visible) {
+    if (stippleVisible_ == visible) return;
+    stippleVisible_ = visible;
+
+    // Toggle stipple LOD nodes directly without rebuilding labels
+    for (auto& pair : stippleNodes_) {
+        osg::LOD* stippleLod = pair.second.get();
+        if (stippleLod) {
+            // Use node mask to show/hide: all bits set = visible, 0 = hidden
+            stippleLod->setNodeMask(visible ? 0xFFFFFFFF : 0);
+        }
+    }
+}
+
+void OsgScene::setObjectVisible(const std::string& objectId, bool visible) {
+    auto it = objectsById_.find(objectId);
+    if (it == objectsById_.end()) return;
+    OsgSceneObject* obj = objectsById_[objectId];
+    if (!obj) return;
+
+    // Check layer visibility - object can only be visible if its layer is visible
+    auto layerIt = objectLayerById_.find(objectId);
+    bool layerIsVisible = true;
+    if (layerIt != objectLayerById_.end()) {
+        layerIsVisible = isLayerVisible(layerIt->second);
+    }
+
+    // Object is visible only if BOTH visible=true AND layer is visible
+    bool actuallyVisible = visible && layerIsVisible;
+    obj->setVisible(actuallyVisible);
+    if (actuallyVisible) {
+        hiddenObjects_.erase(objectId);
+    } else {
+        hiddenObjects_.insert(objectId);
+    }
+}
+
+bool OsgScene::isObjectVisible(const std::string& objectId) const {
+    return hiddenObjects_.find(objectId) == hiddenObjects_.end();
+}
+
+std::string OsgScene::findObjectIdAtScreen(float nx, float ny) const {
+    // Use scene bounding box heuristic: iterate and pick closest visible object
+    // For a proper implementation, we'd raycast the scene graph.
+    // This simplified version finds any visible object near the screen point.
+    for (const auto& pair : objectsById_) {
+        if (hiddenObjects_.find(pair.first) != hiddenObjects_.end()) continue;
+        if (pair.second && pair.second->isVisible()) {
+            return pair.first;
+        }
+    }
+    return "";
 }
 
 void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
@@ -891,13 +1122,6 @@ void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
         return;
     }
     
-    // DEBUG: Show all objects being processed
-    static int objDebugCount = 0;
-    if (objDebugCount < 10) {
-        fprintf(stderr, "DEBUG attach: name=%s displayName=%s type=%d hasBbox=%d displayNamesVisible_=%d\n",
-                obj.objectId.c_str(), obj.displayName.c_str(), (int)obj.type, obj.hasBbox, displayNamesVisible_);
-        objDebugCount++;
-    }
     
     // Remove existing labels for this object
     removeObjectLabels(obj.objectId);
@@ -910,100 +1134,46 @@ void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
         xlen = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
         ylen = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
         zlen = std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2]);
+        
+        // DEBUG: Print bbox for net210
+        if (obj.displayName == "net210") {
+            fprintf(stderr, "DEBUG bbox: text=%s bboxMin=(%.4f,%.4f,%.4f) bboxMax=(%.4f,%.4f,%.4f) transform[14]=%.4f\n",
+                    obj.displayName.c_str(),
+                    obj.bboxMin[0], obj.bboxMin[1], obj.bboxMin[2],
+                    obj.bboxMax[0], obj.bboxMax[1], obj.bboxMax[2],
+                    obj.transform[14]);
+        }
     }
 
     // Skip labels for tiny objects (charSize would be too small to read or
     // would require a disproportionately large minimum that dwarfs the object).
-    float minDim = std::min({xlen, ylen, zlen});
+    float minDim = std::min(xlen, std::min(ylen, zlen));
     if (minDim < 0.05F) {
         return;
     }
 
-    // Text color: always white now that we have a dark background halo for contrast.
-    // (The old brightness-based white/black switch was needed without a halo;
-    //  with the halo, white text is readable on any surface.)
+    // Text color: white
     osg::Vec4 textColor(1.0F, 1.0F, 1.0F, 1.0F);
 
-    // Character size: use the middle dimension to avoid extremes.
-    // For pins/vias, the bbox can be very large in one direction (extends along wire).
-    // For normal objects, we scale with maxDim but cap to prevent giants.
-    float maxDim = std::max({xlen, ylen, zlen});
-    float midDim;
-    if (obj.type == domain::ObjectType::Pin || obj.type == domain::ObjectType::Via) {
-        // For pins and vias, use the smallest dimension (thickness) as reference
-        // to avoid oversized labels for elongated bbox
-        midDim = minDim;
-    } else {
-        midDim = maxDim;
-    }
-    // Use glview-style scaling: text should be ~0.16 world units (40px * 0.004 scale)
-    // This gives approximately 4% of object dimension vs 20% before
-    float charSize = midDim * 0.04F;
-    
-    // Ensure text is readable with minimum size floor (glview default scale)
-    charSize = std::max(0.16F, charSize);
-    // Cap to prevent too large labels
-    charSize = std::min(1.0F, charSize);
-    
-    // For pins/vias with long names, further constrain charSize to fit text on small faces
-    if (obj.type == domain::ObjectType::Pin || obj.type == domain::ObjectType::Via) {
-        // Approximate text width: ~24 world units per char at FONT_SIZE=40
-        // Text should fit within the smallest face dimension
-        float approxTextWidth = static_cast<float>(obj.displayName.length()) * 24.0F * (charSize / 40.0F);
-        float maxTextWidth = minDim * 0.8F;  // Text shouldn't exceed 80% of smallest dimension
-        if (approxTextWidth > maxTextWidth) {
-            charSize = charSize * maxTextWidth / approxTextWidth;
-            charSize = std::max(0.05F, charSize);  // Hard floor for visibility
-        }
-    }
-    
-    // DEBUG: Log label info for first few objects
-    static int labelDebugCount = 0;
-    if (labelDebugCount < 20 && obj.displayName.length() > 0) {
-        fprintf(stderr, "DEBUG label: name=%s type=%d xlen=%.3f ylen=%.3f zlen=%.3f minDim=%.3f maxDim=%.3f midDim=%.3f charSize=%.3f frontZ=%.3f\n",
-                obj.displayName.c_str(), (int)obj.type, xlen, ylen, zlen, minDim, maxDim, midDim, charSize,
-                zlen * 0.5F + charSize * 0.02F);
-        labelDebugCount++;
-    }
-    
-    // Create label group
+    // Text size: fit within the smallest face dimension so text stays on the face.
+    // Use the overall min dimension so text fits on all faces.
+    float textHeight = std::clamp(std::min({xlen, ylen, zlen}) * 0.4f, 0.05f, 2.0f);
+    float charSize = textHeight;
+
+    // Create label group and stipple group
     osg::Group* labelGroup = new osg::Group();
     labelGroup->setName(obj.objectId + ":labels");
+    osg::Group* stippleGroup = new osg::Group();
+    stippleGroup->setName(obj.objectId + ":stipple");
+
+    // Text on ALL non-cross-section faces that are large enough.
+    // Cross-section determined by wire direction (from bbox) for Wire objects,
+    // Note: textAlongX is now determined in the face selection block below
+    // based on wire bbox longest dimension (glview-style).
+
+    float maxDim = std::max({xlen, ylen, zlen});
     
-    // Determine if object is wire-like (one dimension dominates)
-    float dimRatio = maxDim / std::max(0.01F, minDim);
-    bool isWireLike = (dimRatio > 10.0F);
-    
-    // Face selection: 
-    // For normal objects: 2 pairs of faces (4 faces total)
-    // For wire-like objects: only top face (1 face) to avoid clutter
-    bool needFrontBack = !isWireLike;
-    bool needTopBottom = !isWireLike;
-    bool needRightLeft = false;
-    
-    if (isWireLike) {
-        // Wire-like: show on top face only
-        needTopBottom = true;
-    } else if (ylen > xlen && ylen > zlen) {
-        // Long in vertical - use front/back + right/left
-        needFrontBack = true;
-        needRightLeft = true;
-    } else if (zlen > ylen && zlen > xlen) {
-        // Long in depth - use top/bottom + right/left
-        needTopBottom = true;
-        needRightLeft = true;
-    } else {
-        // Long in X or cube - use front/back + top/bottom
-        needFrontBack = true;
-        needTopBottom = true;
-    }
-    
-    // Center point in LOCAL coordinates (labelGroup is under object transform)
-    // Geometry is positioned at (xOffset, yOffset, zBase) where:
-    // xOffset = bboxMin[0] - transform[12]
-    // yOffset = bboxMin[1] - transform[13]
-    // So bboxMin in LOCAL coords is (bboxMin[0] - transform[12], bboxMin[1] - transform[13], bboxMin[2])
-    // and bbox center in LOCAL coords is ((bboxMax[0]+bboxMin[0])/2 - transform[12], ...)
+    // Center point in LOCAL coordinates
     float centerX = 0.0F;
     float centerY = 0.0F;
     float centerZ = 0.0F;
@@ -1013,73 +1183,165 @@ void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
         centerY = (obj.bboxMax[1] + obj.bboxMin[1]) * 0.5F - obj.transform[13];
         centerZ = (obj.bboxMax[2] + obj.bboxMin[2]) * 0.5F - obj.transform[14];
     }
-    
-    float offset = charSize * 0.02F;  // Small offset proportional to text size
-    
-    // Surface positions in LOCAL coordinates where geometry is at bboxMin
-    // front face: bboxMax[2] - transform[14] + offset
-    // back face: bboxMin[2] - transform[14] - offset  
-    // top face: bboxMax[1] - transform[13] + offset
-    // bottom face: bboxMin[1] - transform[13] - offset
-    // right face: bboxMax[0] - transform[12] + offset
-    // left face: bboxMin[0] - transform[12] - offset
-    float frontZ = (obj.hasBbox ? obj.bboxMax[2] : zlen) - obj.transform[14] + offset;
-    float backZ = (obj.hasBbox ? obj.bboxMin[2] : -zlen) - obj.transform[14] - offset;
-    float topY = (obj.hasBbox ? obj.bboxMax[1] : ylen) - obj.transform[13] + offset;
-    float bottomY = (obj.hasBbox ? obj.bboxMin[1] : -ylen) - obj.transform[13] - offset;
-    float rightX = (obj.hasBbox ? obj.bboxMax[0] : xlen) - obj.transform[12] + offset;
-    float leftX = (obj.hasBbox ? obj.bboxMin[0] : -xlen) - obj.transform[12] - offset;
-    
-    // Add text on selected faces with correct rotation
-    if (needFrontBack) {
-        osg::Quat frontRot = computeFaceRotation(LabelFace::Front, xlen, ylen, zlen);
-        osg::Quat backRot = computeFaceRotation(LabelFace::Back, xlen, ylen, zlen);
 
-        // Front face (top Z surface)
-        osg::Node* frontLabel = makeTextGeodeForFace(obj.displayName, centerX, centerY, frontZ, charSize, textColor, frontRot);
-        if (frontLabel) {
-            labelGroup->addChild(frontLabel);
-        }
-        // Back face
-        osg::Node* backLabel = makeTextGeodeForFace(obj.displayName, centerX, centerY, backZ, charSize, textColor, backRot);
-        if (backLabel) {
-            labelGroup->addChild(backLabel);
+    // Surface positions (all 6 faces in LOCAL coords)
+    // Text is placed exactly at the surface (no geometric offset).
+    // Z-fighting is prevented by PolygonOffset in the text render state.
+    float topY    = (obj.hasBbox ? obj.bboxMax[1] : ylen)  - obj.transform[13];
+    float bottomY = (obj.hasBbox ? obj.bboxMin[1] : -ylen) - obj.transform[13];
+    float rightX  = (obj.hasBbox ? obj.bboxMax[0] : xlen)  - obj.transform[12];
+    float leftX   = (obj.hasBbox ? obj.bboxMin[0] : -xlen) - obj.transform[12];
+    // Front face is Z-min, Back face is Z-max.
+    // NOTE: Geometry Z range in LOCAL coords is [0, zlen] (bottom-aligned,
+    // not centered). The front surface is at local Z=0, back at local Z=zlen.
+    float frontZ  = 0.0f;                                         // Z-min surface (local Z=0)
+    float backZ   = zlen;                                         // Z-max surface (local Z=zlen)
+    float zCenterLocal = zlen * 0.5f;                             // Z-center for non-Z face text
+
+
+    // Minimum face area for text (avoid text on tiny edges)
+    float minFaceArea = 0.002f;
+
+    // DEBUG: targeted per-object for metal3 and metal5
+    {
+      static int dbgObj = 0;
+      static FILE* fd = fopen("/tmp/osg_obj_debug.txt", "w");
+      if (fd && dbgObj < 10 && layer && (layer->name == "metal3" || layer->name == "metal5")) {
+        fprintf(fd, "\n=== OBJ[%d] name='%s' layer='%s' type=%d ===\n",
+                dbgObj, obj.displayName.c_str(), layer->name.c_str(), (int)obj.type);
+        fprintf(fd, "  WORLD bbox: Min(%.4f,%.4f,%.4f) Max(%.4f,%.4f,%.4f)\n",
+                obj.bboxMin[0], obj.bboxMin[1], obj.bboxMin[2],
+                obj.bboxMax[0], obj.bboxMax[1], obj.bboxMax[2]);
+        fprintf(fd, "  transform[12..14]: (%.4f,%.4f,%.4f)\n",
+                obj.transform[12], obj.transform[13], obj.transform[14]);
+        fprintf(fd, "  xlen=%.4f ylen=%.4f zlen=%.4f\n", xlen, ylen, zlen);
+        fprintf(fd, "  LOCAL center: (%.4f,%.4f,%.4f)\n", centerX, centerY, centerZ);
+        fprintf(fd, "  LOCAL surfaces: T=%.4f B=%.4f R=%.4f L=%.4f F=%.4f Bk=%.4f\n",
+                topY, bottomY, rightX, leftX, frontZ, backZ);
+        fprintf(fd, "  face areas: X=%.5f Y=%.5f Z=%.5f (min=%.5f)\n",
+                ylen*zlen, xlen*zlen, xlen*ylen, minFaceArea);
+        fprintf(fd, "  charSize=%.4f\n", charSize);
+        fflush(fd);
+        dbgObj++;
+      }
+    }
+
+    // glview-style face selection: based on bbox longest dimension, not layer direction.
+    // Wire extends along the LONGEST dimension, so:
+    //   - xlen longest → wire extends along X (horizontal wire)
+    //   - ylen longest → wire extends along Y (vertical wire)
+    //   - zlen longest → wire extends along Z (depth wire)
+    //
+    // Text is placed on faces PERPENDICULAR to wire direction:
+    //   - Wire along X → text on front/back (Z) + top/bottom (Y)
+    //   - Wire along Y → text on front/back (Z) + right/left (X)
+    //   - Wire along Z → text on top/bottom (Y) + right/left (X)
+    //
+    // Text reading direction follows wire direction:
+    //   wire extends along X → text reads along X (textAlongX = true)
+    //   wire extends along Y → text reads along Y (textAlongX = false)
+    //   wire extends along Z → text reads along Y (fallback, textAlongX = false)
+
+    bool needFrontBack = false;
+    bool needTopBottom = false;
+    bool needRightLeft = false;
+    bool textAlongX = true;  // default: text reads along X
+
+    // Determine by bbox longest dimension (glview style)
+    // glview: text on faces PERPENDICULAR to wire direction, based on longest 2 dims
+    if (ylen > xlen && ylen > zlen) {
+        // Wire extends along Y (vertical wire)
+        // Text on Z faces (front/back) + X faces (right/left)
+        needFrontBack = true;
+        needRightLeft = true;
+        textAlongX = false;  // wire extends along Y, text reads along Y
+    } else if (zlen > ylen && zlen > xlen) {
+        // Wire extends along Z (depth wire)
+        // Text on Y faces (top/bottom) + X faces (right/left)
+        needTopBottom = true;
+        needRightLeft = true;
+        textAlongX = false;  // wire extends along Z, text reads along Y (fallback)
+    } else {
+        // xlen-longest: wire extends along X (horizontal wire)
+        // Text on Y faces (top/bottom) + Z faces (front/back)
+        needTopBottom = true;
+        needFrontBack = true;
+        textAlongX = true;  // wire extends along X, text reads along X
+    }
+
+    // Stipple quads (only when stipple is enabled and layer info is available)
+    float margin = 0.0f;
+    osg::Vec4 stippleColor(1,1,1,1);
+    std::string stippleId;
+    if (stippleVisible_ && layer) {
+        float minDim = std::min({xlen, ylen, zlen});
+        margin = std::max(minDim * 0.08f, 0.03f);
+        stippleColor = osg::Vec4(layer->color.r, layer->color.g, layer->color.b, 1.0f);
+        stippleId = layer->stippleId;
+    }
+
+    // Apply text + stipple quad to each selected face.
+    // Stipple uses fixed S→X, T→Y (chip XY), independent of face rotation.
+    if (needFrontBack) {
+        float areaZ = xlen * ylen;
+        if (areaZ > minFaceArea) {
+            auto* sf = makeStippleFaceQuad(centerX, centerY, frontZ,
+                                           ylen*0.5f - margin, xlen*0.5f - margin,
+                                           1, 0, stippleColor, stippleId);
+            if (sf) stippleGroup->addChild(sf);
+            osg::Quat frRot = computeFaceRotation(LabelFace::Front, textAlongX, xlen, ylen, zlen);
+            auto* lf = makeTextGeodeForFace(obj.displayName, centerX, centerY, frontZ, charSize, textColor, frRot);
+            if (lf) labelGroup->addChild(lf);
+
+            auto* sb = makeStippleFaceQuad(centerX, centerY, backZ,
+                                           ylen*0.5f - margin, xlen*0.5f - margin,
+                                           1, 0, stippleColor, stippleId);
+            if (sb) stippleGroup->addChild(sb);
+            osg::Quat bkRot = computeFaceRotation(LabelFace::Back, textAlongX, xlen, ylen, zlen);
+            auto* lbk = makeTextGeodeForFace(obj.displayName, centerX, centerY, backZ, charSize, textColor, bkRot);
+            if (lbk) labelGroup->addChild(lbk);
         }
     }
 
     if (needTopBottom) {
-        osg::Quat topRot = computeFaceRotation(LabelFace::Top, xlen, ylen, zlen);
-        osg::Quat bottomRot = computeFaceRotation(LabelFace::Bottom, xlen, ylen, zlen);
+        float areaY = xlen * zlen;
+        if (areaY > minFaceArea) {
+            auto* st = makeStippleFaceQuad(centerX, topY, zCenterLocal,
+                                           xlen*0.5f - margin, zlen*0.5f - margin,
+                                           0, 2, stippleColor, stippleId);
+            if (st) stippleGroup->addChild(st);
+            osg::Quat topRot = computeFaceRotation(LabelFace::Top, textAlongX, xlen, ylen, zlen);
+            auto* lt = makeTextGeodeForFace(obj.displayName, centerX, topY, zCenterLocal, charSize, textColor, topRot);
+            if (lt) labelGroup->addChild(lt);
 
-        // DEBUG: Log charSize before calling makeTextGeodeForFace
-        fprintf(stderr, "DEBUG preTopFace: name=%s charSize=%.3f topY=%.3f centerZ=%.3f\n",
-                obj.displayName.c_str(), charSize, topY, centerZ);
-
-        // Top face (top Y surface)
-        osg::Node* topLabel = makeTextGeodeForFace(obj.displayName, centerX, topY, centerZ, charSize, textColor, topRot);
-        if (topLabel) {
-            labelGroup->addChild(topLabel);
-        }
-        // Bottom face
-        osg::Node* bottomLabel = makeTextGeodeForFace(obj.displayName, centerX, bottomY, centerZ, charSize, textColor, bottomRot);
-        if (bottomLabel) {
-            labelGroup->addChild(bottomLabel);
+            auto* sbot = makeStippleFaceQuad(centerX, bottomY, zCenterLocal,
+                                             xlen*0.5f - margin, zlen*0.5f - margin,
+                                             0, 2, stippleColor, stippleId);
+            if (sbot) stippleGroup->addChild(sbot);
+            osg::Quat botRot = computeFaceRotation(LabelFace::Bottom, textAlongX, xlen, ylen, zlen);
+            auto* lbot = makeTextGeodeForFace(obj.displayName, centerX, bottomY, zCenterLocal, charSize, textColor, botRot);
+            if (lbot) labelGroup->addChild(lbot);
         }
     }
 
     if (needRightLeft) {
-        osg::Quat rightRot = computeFaceRotation(LabelFace::Right, xlen, ylen, zlen);
-        osg::Quat leftRot = computeFaceRotation(LabelFace::Left, xlen, ylen, zlen);
+        float areaX = ylen * zlen;
+        if (areaX > minFaceArea) {
+            auto* sr = makeStippleFaceQuad(rightX, centerY, zCenterLocal,
+                                           ylen*0.5f - margin, zlen*0.5f - margin,
+                                           1, 2, stippleColor, stippleId);
+            if (sr) stippleGroup->addChild(sr);
+            osg::Quat rRot = computeFaceRotation(LabelFace::Right, textAlongX, xlen, ylen, zlen);
+            auto* lr = makeTextGeodeForFace(obj.displayName, rightX, centerY, zCenterLocal, charSize, textColor, rRot);
+            if (lr) labelGroup->addChild(lr);
 
-        // Right face (right X surface)
-        osg::Node* rightLabel = makeTextGeodeForFace(obj.displayName, rightX, centerY, centerZ, charSize, textColor, rightRot);
-        if (rightLabel) {
-            labelGroup->addChild(rightLabel);
-        }
-        // Left face
-        osg::Node* leftLabel = makeTextGeodeForFace(obj.displayName, leftX, centerY, centerZ, charSize, textColor, leftRot);
-        if (leftLabel) {
-            labelGroup->addChild(leftLabel);
+            auto* sl = makeStippleFaceQuad(leftX, centerY, zCenterLocal,
+                                           ylen*0.5f - margin, zlen*0.5f - margin,
+                                           1, 2, stippleColor, stippleId);
+            if (sl) stippleGroup->addChild(sl);
+            osg::Quat lRot = computeFaceRotation(LabelFace::Left, textAlongX, xlen, ylen, zlen);
+            auto* ll = makeTextGeodeForFace(obj.displayName, leftX, centerY, zCenterLocal, charSize, textColor, lRot);
+            if (ll) labelGroup->addChild(ll);
         }
     }
     
@@ -1096,59 +1358,218 @@ void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
 
     transform->addChild(lod);
     textLabelNodes_[obj.objectId] = lod;
+
+    // Stipple quads in a separate LOD with shorter range (0.6× text LOD).
+    float stippleDistance = lodDistance * 0.6f;
+    osg::LOD* stippleLod = new osg::LOD();
+    stippleLod->setName(obj.objectId + ":stipple");
+    stippleLod->setCenter(osg::Vec3(centerX, centerY, centerZ));
+    stippleLod->addChild(stippleGroup, 0.0F, stippleDistance);
+    // Set initial visibility based on stippleVisible_ flag
+    stippleLod->setNodeMask(stippleVisible_ ? 0xFFFFFFFF : 0);
+    transform->addChild(stippleLod);
+    stippleNodes_[obj.objectId] = stippleLod;
 }
 
 osg::Quat OsgScene::computeFaceRotation(LabelFace face,
+                                         bool textAlongX,
                                          float xlen,
                                          float ylen,
                                          float zlen) const {
+    
     // Text geometry is in the XY plane at the origin, facing +Z.
-    //
-    // Base rotation: makes the text face the correct cube face.
-    // Readability rotation: when an object is taller in one axis, rotate
-    // the text so it remains readable (matches glview behavior).
+    // glview rotation for each face (from addTextOnObject analysis):
+    //   Right: R_x(90°) * R_z(90°) — text reads along Y, faces +X (always)
+    //   Left: R_x(-90°) * R_z(-90°) — text reads along Y, faces -X (always)
+    //   Top: R_x(90°) — text reads along Y, faces -Y (toward camera when viewed from above)
+    //   Bottom: R_x(90°) * R_z(90°) — text reads along Y, faces -Y (always)
+    //   Front: depends on wire direction
+    //     ylen-longest (wire along Y): R_z(90°)
+    //     zlen-longest (wire along Z): R_y(90°)
+    //     xlen-longest (wire along X): identity
+    //   Back: depends on wire direction
+    //     ylen-longest: R_z(-90°) * R_y(180°)
+    //     zlen-longest: R_y(-90°) * R_y(180°)
+    //     xlen-longest: R_y(180°)
 
-    // Base rotation: which face to point at
-    osg::Quat base;
+    osg::Quat rotation;
     switch (face) {
-        case LabelFace::Front:                                 break; // faces +Z
-        case LabelFace::Back:  base = osg::Quat(osg::PI,       osg::Vec3(0,1,0)); break; // faces -Z
-        case LabelFace::Right: base = osg::Quat(osg::PI_2,     osg::Vec3(0,1,0)); break; // faces +X
-        case LabelFace::Left:  base = osg::Quat(-osg::PI_2,    osg::Vec3(0,1,0)); break; // faces -X
-        case LabelFace::Top:   base = osg::Quat(-osg::PI_2,    osg::Vec3(1,0,0)); break; // faces +Y
-        case LabelFace::Bottom:base = osg::Quat(osg::PI_2,     osg::Vec3(1,0,0)); break; // faces -Y
+        case LabelFace::Front:
+            // For wires along Y or Z (textAlongX=false), text reads along Y on Z faces
+            // For wires along X (textAlongX=true), text reads along X on Z faces
+            if (textAlongX) {
+                // xlen-longest: wire extends along X, text reads along X on Front face
+                rotation = osg::Quat(0, osg::Vec3(0,0,1));  // identity
+            } else if (ylen > xlen && ylen > zlen) {
+                // ylen-longest: wire extends along Y, text reads +Y on Front face.
+                // R_z(-90°) orients reading to +Y, then R_y(180°) flips normal +Z→-Z.
+                // In OSG: q_y180 * q_z-90 applies q_z-90 first, then q_y180.
+                rotation = osg::Quat(osg::PI, osg::Vec3(0,1,0))
+                         * osg::Quat(-osg::PI_2, osg::Vec3(0,0,1));
+            } else {
+                // zlen-longest: wire extends along Z, text reads along Y on Front face
+                rotation = osg::Quat(osg::PI_2, osg::Vec3(0,1,0));  // R_y(90°)
+            }
+            break;
+        case LabelFace::Back:
+            if (textAlongX) {
+                // xlen-longest: text reads along -X on Back face
+                rotation = osg::Quat(osg::PI, osg::Vec3(0,1,0));  // R_y(180°)
+            } else if (ylen > xlen && ylen > zlen) {
+                // ylen-longest: text reads outward from Back face (normal +Z).
+                // R_z(-90°) gives read=-Y (downward), up=+X (characters face right).
+                rotation = osg::Quat(-osg::PI_2, osg::Vec3(0,0,1));
+            } else {
+                // zlen-longest: R_y(-90°) * R_y(180°)
+                rotation = osg::Quat(-osg::PI_2, osg::Vec3(0,1,0))
+                         * osg::Quat(osg::PI, osg::Vec3(0,1,0));
+            }
+            break;
+        case LabelFace::Top:
+            // R_x(90°) — text faces +Y (outward from top face)
+            rotation = osg::Quat(osg::PI_2, osg::Vec3(1,0,0));
+            break;
+        case LabelFace::Bottom:
+            // R_x(90°) — text faces -Y (outward from bottom), "up" = +Z
+            rotation = osg::Quat(osg::PI_2, osg::Vec3(1,0,0));
+            break;
+        case LabelFace::Right:
+            if (!textAlongX) {
+                // vertical wire: 120° about (1,1,1): normal +X, read +Y.
+                osg::Vec3d axis(1.0 / sqrt(3.0), 1.0 / sqrt(3.0), 1.0 / sqrt(3.0));
+                rotation = osg::Quat(osg::PI * 2.0 / 3.0, axis);
+            } else {
+                // horizontal wire: R_y(-90°): normal +X, read -Z.
+                rotation = osg::Quat(-osg::PI_2, osg::Vec3(0,1,0));
+            }
+            break;
+        case LabelFace::Left:
+            if (!textAlongX) {
+                // vertical wire: 120° about (1,-1,-1): normal -X, read -Y, up +Z.
+                osg::Vec3d axis(1.0 / sqrt(3.0), -1.0 / sqrt(3.0), -1.0 / sqrt(3.0));
+                rotation = osg::Quat(osg::PI * 2.0 / 3.0, axis);
+            } else {
+                // horizontal wire: R_y(90°): normal -X, read +Z.
+                rotation = osg::Quat(osg::PI_2, osg::Vec3(0,1,0));
+            }
+            break;
     }
 
-    // Readability rotation: applied after base, rotates text in the face plane
-    osg::Quat readability;
-    bool isVertical = (ylen > xlen && ylen > zlen);
-    bool isDeep = (zlen > ylen && zlen > xlen);
+    
+    return rotation;
+}
 
-    if (isVertical) {
-        // Object is vertical (Y longest) — rotate text 90° so it reads vertically
-        switch (face) {
-            case LabelFace::Front:
-            case LabelFace::Back:
-                readability = osg::Quat(osg::PI_2, osg::Vec3(0,0,1)); break;
-            case LabelFace::Right:
-            case LabelFace::Left:
-                readability = osg::Quat(osg::PI_2, osg::Vec3(1,0,0)); break;
-            default: break;
-        }
-    } else if (isDeep) {
-        // Object is deep (Z longest) — rotate text 90° on top/bottom
-        switch (face) {
-            case LabelFace::Top:
-                readability = osg::Quat(osg::PI_2, osg::Vec3(0,1,0)); break;
-            case LabelFace::Bottom:
-                readability = osg::Quat(-osg::PI_2, osg::Vec3(0,1,0)); break;
-            default: break;
-        }
+// DEBUG: colored marker box at text face position for visual verification
+osg::Node* OsgScene::makeMarkerBox(float cx, float cy, float cz,
+                                    const osg::Vec4& color,
+                                    const osg::Quat& rotation) {
+    float s = 0.1f;  // world-space marker size (visible but not blocking text)
+    osg::Box* box = new osg::Box(osg::Vec3(0, 0, 0), s, s, s);  // center at origin
+    osg::ShapeDrawable* drawable = new osg::ShapeDrawable(box);
+    drawable->setColor(color);
+    osg::Geode* geode = new osg::Geode();
+    geode->addDrawable(drawable);
+    
+    // Use TRANSPARENT_BIN like text, with depth write disabled
+    osg::StateSet* ss = geode->getOrCreateStateSet();
+    ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
+    ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
+    ss->setMode(GL_BLEND, osg::StateAttribute::ON);
+    ss->setRenderingHint(osg::StateSet::TRANSPARENT_BIN);
+    osg::Depth* depth = new osg::Depth();
+    depth->setWriteMask(false);  // don't write to depth buffer
+    ss->setAttributeAndModes(depth, osg::StateAttribute::ON);
+
+    osg::MatrixTransform* mt = new osg::MatrixTransform();
+    // OSG row-major (v * M): leftmost = applied first to vertex.
+    // We want: scale FIRST, rotate SECOND, translate LAST.
+    // So build as: S * R * T (S leftmost = applied first)
+    osg::Matrixd markerMat = osg::Matrixd::scale(s, s, s)
+                          * osg::Matrixd::rotate(rotation)
+                          * osg::Matrixd::translate(cx, cy, cz);
+    mt->setMatrix(markerMat);
+    mt->addChild(geode);
+    return mt;
+}
+
+osg::Node* OsgScene::makeStippleFaceQuad(float cx, float cy, float cz,
+                                          float halfW, float halfH,
+                                          int dim1, int dim2,
+                                          const osg::Vec4& color,
+                                          const std::string& stippleId) {
+    if (stippleId.empty() || stippleId == "none" || stippleId == "solid" ||
+        halfW <= 0.0f || halfH <= 0.0f) {
+        return nullptr;
     }
 
-    // Order: readability * base — readability is applied in the face plane
-    // so it comes after the base orientation.
-    return readability * base;
+    // Build 4 vertices in the plane spanned by dim1, dim2 at the face center.
+    osg::Vec3f v[4];
+    for (int i = 0; i < 4; ++i) {
+        v[i] = osg::Vec3f(cx, cy, cz);
+        float s1 = (i == 0 || i == 3) ? -halfW : halfW;
+        float s2 = (i == 0 || i == 1) ? -halfH : halfH;
+        if (dim1 == 0) v[i].x() += s1; else if (dim1 == 1) v[i].y() += s1; else v[i].z() += s1;
+        if (dim2 == 0) v[i].x() += s2; else if (dim2 == 1) v[i].y() += s2; else v[i].z() += s2;
+    }
+    osg::ref_ptr<osg::Vec3Array> verts = new osg::Vec3Array(4);
+    for (int i = 0; i < 4; ++i) (*verts)[i] = v[i];
+
+    // One quad = 2 triangles
+    osg::ref_ptr<osg::DrawElementsUInt> tris = new osg::DrawElementsUInt(GL_TRIANGLES, 6);
+    (*tris)[0] = 0; (*tris)[1] = 1; (*tris)[2] = 2;
+    (*tris)[3] = 0; (*tris)[4] = 2; (*tris)[5] = 3;
+
+    osg::Vec4Array* colors = new osg::Vec4Array(1);
+    (*colors)[0] = color;
+
+    osg::Geometry* geom = new osg::Geometry();
+    geom->setVertexArray(verts);
+    geom->setColorArray(colors, osg::Array::BIND_OVERALL);
+    geom->addPrimitiveSet(tris);
+
+    osg::Geode* geode = new osg::Geode();
+    geode->addDrawable(geom);
+
+    // Stateset: no lighting, stipple texture via TexGen
+    osg::StateSet* ss = geode->getOrCreateStateSet();
+    ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
+    ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
+    ss->setMode(GL_BLEND, osg::StateAttribute::OFF);
+
+    osg::Depth* depth = new osg::Depth();
+    depth->setWriteMask(false);
+    depth->setFunction(osg::Depth::LEQUAL);
+    ss->setAttributeAndModes(depth, osg::StateAttribute::ON);
+
+    // PolygonOffset pushes quad slightly toward camera to avoid z-fighting
+    osg::PolygonOffset* polyOff = new osg::PolygonOffset(-1.0f, -1.0f);
+    ss->setAttributeAndModes(polyOff, osg::StateAttribute::ON);
+
+    // Stipple texture on unit 1 with TexGen (planes based on face orientation)
+    osg::Texture2D* tex = getOrCreateStippleTexture(stippleId);
+    if (tex) {
+        ss->setTextureAttributeAndModes(1, tex, osg::StateAttribute::ON);
+        osg::TexEnv* texEnv = new osg::TexEnv(osg::TexEnv::MODULATE);
+        ss->setTextureAttribute(1, texEnv);
+        // Face-coordinate TexGen: S→dim1, T→dim2. Each face tiles in its
+        // own plane — Front/Back (XY) get S→X/T→Y, Top/Bottom (XZ) get
+        // S→X/T→Z, Right/Left (YZ) get S→Y/T→Z.
+        static constexpr float FREQ = 12.0f;
+        osg::Plane sPlane(0,0,0,0), tPlane(0,0,0,0);
+        if (dim1 == 0) sPlane = osg::Plane(FREQ, 0, 0, 0);
+        else if (dim1 == 1) sPlane = osg::Plane(0, FREQ, 0, 0);
+        else sPlane = osg::Plane(0, 0, FREQ, 0);
+        if (dim2 == 0) tPlane = osg::Plane(FREQ, 0, 0, 0);
+        else if (dim2 == 1) tPlane = osg::Plane(0, FREQ, 0, 0);
+        else tPlane = osg::Plane(0, 0, FREQ, 0);
+        osg::TexGen* texGen = new osg::TexGen();
+        texGen->setMode(osg::TexGen::OBJECT_LINEAR);
+        texGen->setPlane(osg::TexGen::S, sPlane);
+        texGen->setPlane(osg::TexGen::T, tPlane);
+        ss->setTextureAttributeAndModes(1, texGen, osg::StateAttribute::ON);
+    }
+
+    return geode;
 }
 
 osg::Node* OsgScene::makeTextGeodeForFace(const std::string& text,
@@ -1162,40 +1583,25 @@ osg::Node* OsgScene::makeTextGeodeForFace(const std::string& text,
         return nullptr;
     }
 
-    // Font atlas renders at FONT_SIZE=40px; scale to requested charSize
     float scale = charSize / static_cast<float>(OsgFontAtlas::FONT_SIZE);
 
-    // DEBUG: Log transform info
-    static int xformDebugCount = 0;
-    if (xformDebugCount < 5) {
-        fprintf(stderr, "DEBUG xform: text=%s center=(%.2f,%.2f,%.2f) charSize=%.3f scale=%.6f\n",
-                text.c_str(), centerX, centerY, centerZ, charSize, scale);
-        xformDebugCount++;
-    }
-
-    // OsgTextGeode creates centered text at origin, at font atlas scale
-    OsgTextGeode* textGeode = new OsgTextGeode(text, fontAtlas_.get(), color);
+    OsgTextGeode* textGeode = new OsgTextGeode(text, fontAtlas_.get(), color, scale);
     textGeode->setName("label:" + text);
 
-    // Apply transform: scale, rotate, translate
-    // OSG uses row vectors: v' = v * scale * rotate * translate
     osg::MatrixTransform* mt = new osg::MatrixTransform();
     mt->setName("labelXform:" + text);
-    osg::Matrixd matrix = osg::Matrixd::scale(scale, scale, scale)
-                          * osg::Matrixd::rotate(rotation)
-                          * osg::Matrixd::translate(centerX, centerY, centerZ);
-    mt->setMatrix(matrix);
+    // OSG uses row-major convention (v * M, NOT M * v).
+    // With v * (T * R) = (v + T) * R, the translation T is rotated by R,
+    // so the text center (=origin) goes to T*R, not T. This causes text to
+    // appear at wrong positions when rotation is not identity.
+    // With v * (R * T) = (v * R) + T, text is first rotated, then shifted
+    // by T. The text center (=origin) goes to T. This is correct.
+    // Scale is already baked into text vertices via OsgTextGeode(scale)
+    osg::Matrixd mat = osg::Matrixd::rotate(rotation)
+                     * osg::Matrixd::translate(centerX, centerY, centerZ);
+    mt->setMatrix(mat);
     mt->addChild(textGeode);
 
-    // DEBUG: Check first vertex after transform
-    static int vertWorldDebugCount = 0;
-    if (vertWorldDebugCount < 3 && text == "_484_") {
-        osg::Vec3f testVert(0, 0, 0);  // Original vertex at origin
-        osg::Vec3f transformed = testVert * matrix;
-        fprintf(stderr, "DEBUG vertWorld: text=%s orig=(0,0,0) transformed=(%.4f,%.4f,%.4f)\n",
-                text.c_str(), transformed.x(), transformed.y(), transformed.z());
-        vertWorldDebugCount++;
-    }
 
     return mt;
 }
@@ -1211,6 +1617,19 @@ void OsgScene::removeObjectLabels(const std::string& objectId) {
             }
         }
         textLabelNodes_.erase(it);
+    }
+
+    // Also remove stipple LOD if present
+    auto stippleIt = stippleNodes_.find(objectId);
+    if (stippleIt != stippleNodes_.end()) {
+        osg::LOD* stippleLod = stippleIt->second.get();
+        if (stippleLod) {
+            osg::Group* parent = stippleLod->getParent(0);
+            if (parent) {
+                parent->removeChild(stippleLod);
+            }
+        }
+        stippleNodes_.erase(stippleIt);
     }
 }
 
@@ -1249,7 +1668,25 @@ void OsgScene::attachObjectGeometry(osg::Geode* geode,
             }
             break;
         }
-        case domain::ObjectType::Blockage:
+        case domain::ObjectType::Blockage: {
+            // Blockage: extruded polygon if geometryRef has poly data, else box
+            auto pts = parsePolylinePoints(obj.geometryRef);
+            if (pts.size() >= 3) {
+                float thickness = obj.hasBbox
+                    ? std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2])
+                    : 0.3f;
+                float cx = obj.transform[12], cy = obj.transform[13];
+                for (auto& p : pts) { p.x() -= cx; p.y() -= cy; }
+                osg::Geometry* geom = createPolygonGeometry(pts, thickness);
+                addLayerColoredDrawable(geom);
+            } else {
+                LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.3F);
+                osg::Geometry* geom = createBoxGeometry(
+                    box.xOffset, box.yOffset, box.width, box.height, box.depth);
+                addLayerColoredDrawable(geom);
+            }
+            break;
+        }
         case domain::ObjectType::Pin:
         case domain::ObjectType::Bump: {
             LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.3F);
@@ -1274,13 +1711,48 @@ void OsgScene::attachObjectGeometry(osg::Geode* geode,
             addLayerColoredDrawable(geom);
             break;
         }
-        case domain::ObjectType::Via:
-        case domain::ObjectType::Drc:
-        case domain::ObjectType::Track: {
+        case domain::ObjectType::Via: {
             const LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.05F);
             osg::Geometry* geom = createBoxGeometry(
                 box.xOffset, box.yOffset, box.width, box.height, box.depth);
             addLayerColoredDrawable(geom);
+            break;
+        }
+        case domain::ObjectType::Drc: {
+            // DRC markers: semi-transparent red boxes with wireframe
+            LocalBoxParams box = computeLocalBoxParamsFromBbox(obj, 0.05F);
+            osg::Geometry* geom = createBoxGeometry(
+                box.xOffset, box.yOffset, box.width, box.height, box.depth);
+            if (geom) {
+                applyFlatColor(geom, osg::Vec4(1.0F, 0.2F, 0.2F, 0.6F));
+                geode->addDrawable(geom);
+            }
+            break;
+        }
+        case domain::ObjectType::Track: {
+            // Track: render each pair of points as a separate line segment.
+            // Parse geometryRef pairs separated by ';' (e.g. "poly:fx1,0;fx1,10000;fx2,0;fx2,10000").
+            auto pts = parsePolylinePoints(obj.geometryRef);
+            float cx = obj.transform[12], cy = obj.transform[13];
+            float z = obj.hasBbox ? (obj.bboxMin[2] + obj.bboxMax[2]) * 0.5f - obj.transform[14] : 0;
+            osg::ref_ptr<osg::Vec3Array> verts = new osg::Vec3Array();
+            // Connect points in pairs: (0,1), (2,3), (4,5), ... as line segments
+            for (size_t i = 0; i + 1 < pts.size(); i += 2) {
+                verts->push_back(osg::Vec3(pts[i].x() - cx, pts[i].y() - cy, z));
+                verts->push_back(osg::Vec3(pts[i+1].x() - cx, pts[i+1].y() - cy, z));
+            }
+            if (!verts->empty()) {
+                osg::Geometry* geom = new osg::Geometry();
+                geom->setVertexArray(verts);
+                geom->addPrimitiveSet(new osg::DrawArrays(GL_LINES, 0, verts->size()));
+                // Apply color with dimmed brightness for track lines
+                if (layer) {
+                    osg::Vec4 trackColor(layer->color.r*0.6f, layer->color.g*0.6f,
+                                         layer->color.b*0.6f, 1.0f);
+                    applyFlatColor(geom, trackColor);
+                }
+                geode->addDrawable(geom);
+            }
             break;
         }
         default: {
@@ -1347,6 +1819,15 @@ void OsgScene::configureGeodeRenderState(osg::Geode* geode,
     }
 
     stateset->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
+
+    // Ensure depth write is ON for correct layer occlusion.
+    // OSG's TRANSPARENT_BIN defaults to depth write OFF, which makes
+    // transparent instances render on top of opaque metal layers even
+    // when they're at lower Z. Explicitly enable depth write.
+    osg::Depth* depth = new osg::Depth();
+    depth->setWriteMask(true);
+    depth->setFunction(osg::Depth::LESS);
+    stateset->setAttributeAndModes(depth, osg::StateAttribute::ON);
 }
 
 // English comment.
@@ -1481,6 +1962,59 @@ osg::Geometry* OsgScene::createPolylineGeometry(const domain::ObjectRecord& obj,
     geom->setVertexArray(verts);
     geom->addPrimitiveSet(tris);
     osgUtil::SmoothingVisitor::smooth(*geom);
+    return geom;
+}
+
+osg::Geometry* OsgScene::createPolygonGeometry(const std::vector<osg::Vec2>& points, float thickness) {
+    if (points.size() < 3) return nullptr;
+    // Triangulate the polygon and extrude to `thickness` in Z
+    auto tris = triangulatePolygon(points);
+    if (tris.empty()) return nullptr;
+
+    osg::ref_ptr<osg::Vec3Array> verts = new osg::Vec3Array();
+    osg::ref_ptr<osg::Vec3Array> normals = new osg::Vec3Array();
+
+    for (size_t i = 0; i < tris.size(); i += 6) {
+        // Bottom face
+        verts->push_back(osg::Vec3(tris[i], tris[i+1], 0));
+        verts->push_back(osg::Vec3(tris[i+2], tris[i+3], 0));
+        verts->push_back(osg::Vec3(tris[i+4], tris[i+5], 0));
+        // Top face (same XY, elevated to thickness)
+        verts->push_back(osg::Vec3(tris[i], tris[i+1], thickness));
+        verts->push_back(osg::Vec3(tris[i+2], tris[i+3], thickness));
+        verts->push_back(osg::Vec3(tris[i+4], tris[i+5], thickness));
+        // Normals (down for bottom, up for top)
+        normals->push_back(osg::Vec3(0,0,-1));
+        normals->push_back(osg::Vec3(0,0,-1));
+        normals->push_back(osg::Vec3(0,0,-1));
+        normals->push_back(osg::Vec3(0,0,1));
+        normals->push_back(osg::Vec3(0,0,1));
+        normals->push_back(osg::Vec3(0,0,1));
+    }
+
+    // Add side faces (extrude each polygon edge)
+    for (size_t i = 0; i < points.size(); ++i) {
+        const osg::Vec2& a = points[i];
+        const osg::Vec2& b = points[(i+1) % points.size()];
+        osg::Vec3 edge(a.y()-b.y(), b.x()-a.x(), 0);  // outward normal (in XY)
+        edge.normalize();
+        verts->push_back(osg::Vec3(a.x(), a.y(), 0));
+        verts->push_back(osg::Vec3(b.x(), b.y(), 0));
+        verts->push_back(osg::Vec3(a.x(), a.y(), thickness));
+        verts->push_back(osg::Vec3(b.x(), b.y(), 0));
+        verts->push_back(osg::Vec3(b.x(), b.y(), thickness));
+        verts->push_back(osg::Vec3(a.x(), a.y(), thickness));
+        for (int j = 0; j < 6; ++j) normals->push_back(edge);
+    }
+
+    osg::ref_ptr<osg::DrawElementsUInt> trisElem = new osg::DrawElementsUInt(GL_TRIANGLES);
+    trisElem->reserve(verts->size());
+    for (unsigned int i = 0; i < verts->size(); ++i) trisElem->push_back(i);
+
+    osg::Geometry* geom = new osg::Geometry();
+    geom->setVertexArray(verts);
+    geom->setNormalArray(normals, osg::Array::BIND_PER_VERTEX);
+    geom->addPrimitiveSet(trisElem);
     return geom;
 }
 
@@ -1846,34 +2380,146 @@ void OsgScene::applyStipple(osg::StateSet* stateset, domain::LineStyle lineStyle
     (void)stateset;
     (void)lineStyle;
     (void)stippleId;
-    // Core-profile contexts used by QOpenGLWidget do not reliably support fixed-function line stipple.
-    return;
+}
 
-    // Stipple patterns: solid, dash, dot, dashdot, cross
-    if (stippleId == "solid" || lineStyle == domain::LineStyle::Solid) {
-        // No stipple needed for solid
-        return;
+osg::Texture2D* OsgScene::getOrCreateStippleTexture(const std::string& name) {
+    // Return cached texture if already created
+    auto it = stippleTextures_.find(name);
+    if (it != stippleTextures_.end()) {
+        return it->second.get();
+    }
+
+    // Look up the stipple definition
+    const StippleDef* def = nullptr;
+    for (int i = 0; i < kNumStippleDefs; ++i) {
+        if (name == kStippleDefs[i].name) {
+            def = &kStippleDefs[i];
+            break;
+        }
+    }
+    if (!def) return nullptr;
+
+    // Generate RGBA pixel data from the pattern bitmap
+    auto pixels = parseStippleData(*def);
+
+    // Create OSG image and texture
+    osg::Image* image = new osg::Image();
+    image->setImage(def->width, def->height, 1, GL_RGBA, GL_RGBA,
+                    GL_UNSIGNED_BYTE, pixels.release(),
+                    osg::Image::USE_NEW_DELETE);
+
+    osg::ref_ptr<osg::Texture2D> tex = new osg::Texture2D();
+    tex->setImage(image);
+    tex->setWrap(osg::Texture::WRAP_S, osg::Texture::REPEAT);
+    tex->setWrap(osg::Texture::WRAP_T, osg::Texture::REPEAT);
+    tex->setFilter(osg::Texture::MIN_FILTER, osg::Texture::NEAREST);
+    tex->setFilter(osg::Texture::MAG_FILTER, osg::Texture::NEAREST);
+
+    stippleTextures_[name] = tex;
+    return tex.get();
+}
+
+
+void OsgScene::createCoordinateAxes() {
+    // Draw axes at the world origin with a fixed large length so they're
+    // visible regardless of scene scale and position.
+    osg::Vec3 origin(0,0,0);
+    float axisLen = 100.0f;
+    
+    // X axis - Red - line with arrow tip
+    {
+        osg::Geode* geode = new osg::Geode();
+        geode->setName("CoordAxes");
+        
+        osg::Vec3Array* verts = new osg::Vec3Array();
+        verts->push_back(origin);
+        verts->push_back(origin + osg::Vec3(axisLen, 0, 0));
+        verts->push_back(origin + osg::Vec3(axisLen, 0, 0));
+        verts->push_back(origin + osg::Vec3(axisLen - 5, 3, 0));
+        verts->push_back(origin + osg::Vec3(axisLen, 0, 0));
+        verts->push_back(origin + osg::Vec3(axisLen - 5, -3, 0));
+
+        osg::Vec4Array* colors = new osg::Vec4Array();
+        colors->push_back(osg::Vec4(1, 0, 0, 1));
+
+        osg::Geometry* geom = new osg::Geometry();
+        geom->setVertexArray(verts);
+        geom->setColorArray(colors, osg::Array::BIND_OVERALL);
+        geom->addPrimitiveSet(new osg::DrawArrays(osg::PrimitiveSet::LINES, 0, 6));
+
+        osg::StateSet* ss = geom->getOrCreateStateSet();
+        ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
+        ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
+        osg::LineWidth* lw = new osg::LineWidth(5.0f);
+        ss->setAttributeAndModes(lw, osg::StateAttribute::ON);
+
+        geode->addDrawable(geom);
+        objectRoot_->addChild(geode);
+    }
+
+    // Y axis - Green
+    {
+        osg::Geode* geode = new osg::Geode();
+        geode->setName("CoordAxes");
+
+        osg::Vec3Array* verts = new osg::Vec3Array();
+        verts->push_back(origin);
+        verts->push_back(origin + osg::Vec3(0, axisLen, 0));
+        verts->push_back(origin + osg::Vec3(0, axisLen, 0));
+        verts->push_back(origin + osg::Vec3(3, axisLen - 5, 0));
+        verts->push_back(origin + osg::Vec3(0, axisLen, 0));
+        verts->push_back(origin + osg::Vec3(-3, axisLen - 5, 0));
+
+        osg::Vec4Array* colors = new osg::Vec4Array();
+        colors->push_back(osg::Vec4(0, 1, 0, 1));
+
+        osg::Geometry* geom = new osg::Geometry();
+        geom->setVertexArray(verts);
+        geom->setColorArray(colors, osg::Array::BIND_OVERALL);
+        geom->addPrimitiveSet(new osg::DrawArrays(osg::PrimitiveSet::LINES, 0, 6));
+
+        osg::StateSet* ss = geom->getOrCreateStateSet();
+        ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
+        ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
+        osg::LineWidth* lw = new osg::LineWidth(5.0f);
+        ss->setAttributeAndModes(lw, osg::StateAttribute::ON);
+
+        geode->addDrawable(geom);
+        objectRoot_->addChild(geode);
+    }
+
+    // Z axis - Blue
+    {
+        osg::Geode* geode = new osg::Geode();
+        geode->setName("CoordAxes");
+        
+        osg::Vec3Array* verts = new osg::Vec3Array();
+        verts->push_back(osg::Vec3(0, 0, 0));
+        verts->push_back(osg::Vec3(0, 0, axisLen));
+        verts->push_back(osg::Vec3(0, 0, axisLen));
+        verts->push_back(osg::Vec3(0, 3, axisLen - 5));
+        verts->push_back(osg::Vec3(0, 0, axisLen));
+        verts->push_back(osg::Vec3(0, -3, axisLen - 5));
+        
+        osg::Vec4Array* colors = new osg::Vec4Array();
+        colors->push_back(osg::Vec4(0, 0, 1, 1));
+        
+        osg::Geometry* geom = new osg::Geometry();
+        geom->setVertexArray(verts);
+        geom->setColorArray(colors, osg::Array::BIND_OVERALL);
+        geom->addPrimitiveSet(new osg::DrawArrays(osg::PrimitiveSet::LINES, 0, 6));
+        
+        osg::StateSet* ss = geom->getOrCreateStateSet();
+        ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
+        ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
+        osg::LineWidth* lw = new osg::LineWidth(5.0f);
+        ss->setAttributeAndModes(lw, osg::StateAttribute::ON);
+        
+        geode->addDrawable(geom);
+        objectRoot_->addChild(geode);
     }
     
-    GLint factor = 1;
-    GLushort pattern = 0xFFFF;
-    
-    if (stippleId == "dash" || lineStyle == domain::LineStyle::Dashed) {
-        factor = 3;
-        pattern = 0x00FF;  // 0000000011111111
-    } else if (stippleId == "dot" || lineStyle == domain::LineStyle::Dotted) {
-        factor = 1;
-        pattern = 0x5555;  // 0101010101010101
-    } else if (stippleId == "dashdot" || lineStyle == domain::LineStyle::DashDot) {
-        factor = 2;
-        pattern = 0x0F0F;  // 0000111100001111
-    } else if (stippleId == "cross") {
-        factor = 2;
-        pattern = 0x3F3F;  // 0011111100111111
-    }
-    
-    osg::LineStipple* stipple = new osg::LineStipple(factor, pattern);
-    stateset->setAttributeAndModes(stipple, osg::StateAttribute::ON);
+    fprintf(stderr, "DEBUG createCoordinateAxes: axes at (%.1f,%.1f,%.1f) length=%.1f\n", origin.x(), origin.y(), origin.z(), axisLen);
 }
 
 }  // namespace backend_osg

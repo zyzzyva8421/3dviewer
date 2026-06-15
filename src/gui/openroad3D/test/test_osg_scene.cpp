@@ -479,6 +479,232 @@ TEST_F(OsgSceneTest, LabelCharSizeProportionalToObjectSize) {
   scene_.removeObject(largeObj);
 }
 
+// ---------------------------------------------------------------------------
+//  Label Z positioning on surfaces (the "text on wire surface" regression)
+// ---------------------------------------------------------------------------
+
+// Helper: find all label MatrixTransform nodes for an object, traversing LOD
+static std::vector<osg::Vec3d> getLabelTranslations(osg::Group* root,
+                                                     const std::string& objId) {
+  std::vector<osg::Vec3d> result;
+  if (!root) return result;
+
+  osg::MatrixTransform* objMT = nullptr;
+  for (unsigned int i = 0; i < root->getNumChildren(); ++i) {
+    if (root->getChild(i)->getName() == objId) {
+      objMT = dynamic_cast<osg::MatrixTransform*>(root->getChild(i));
+      break;
+    }
+  }
+  if (!objMT) return result;
+
+  osg::Group* objGroup = objMT->asGroup();
+  if (!objGroup) return result;
+
+  // Find LOD
+  osg::Group* lod = nullptr;
+  for (unsigned int i = 0; i < objGroup->getNumChildren(); ++i) {
+    if (objGroup->getChild(i)->getName().find(":labels") != std::string::npos) {
+      lod = objGroup->getChild(i)->asGroup();
+      break;
+    }
+  }
+  if (!lod) return result;
+
+  // LOD first child = inner label group
+  osg::Group* innerGroup = nullptr;
+  for (unsigned int i = 0; i < lod->getNumChildren(); ++i) {
+    if (lod->getChild(i)->asGroup()) {
+      innerGroup = lod->getChild(i)->asGroup();
+      break;
+    }
+  }
+  if (!innerGroup) return result;
+
+  // Collect label MatrixTransform translations
+  for (unsigned int i = 0; i < innerGroup->getNumChildren(); ++i) {
+    osg::Node* child = innerGroup->getChild(i);
+    if (child->getName().find("labelXform:") == std::string::npos) continue;
+    osg::MatrixTransform* mt = dynamic_cast<osg::MatrixTransform*>(child);
+    if (!mt) continue;
+    result.push_back(mt->getMatrix().getTrans());
+  }
+  return result;
+}
+
+TEST_F(OsgSceneTest, LabelZPositionOnVerticalWire) {
+  // Vertical wire (ylen > xlen, ylen > zlen):
+  //   - Text on Front/Back (Z faces) → Z = -offset / zlen+offset
+  //   - Text on Right/Left (X faces) → Z = zlen/2 (centered)
+  scene_.updateLayer(makeLayer("metal1", 0.065f, 0.13f));
+
+  ObjectRecord wire;
+  wire.objectId = "vwire";
+  wire.type = ObjectType::Wire;
+  wire.displayName = "vnet";
+  wire.layerId = "metal1";
+  wire.hasBbox = true;
+  // ylen=5.0 > xlen=0.2, zlen=0.13
+  wire.bboxMin = {9.9f, 10.0f, 0.0f};
+  wire.bboxMax = {10.1f, 15.0f, 0.13f};
+
+  float cx = (wire.bboxMin[0] + wire.bboxMax[0]) * 0.5f;
+  float cy = (wire.bboxMin[1] + wire.bboxMax[1]) * 0.5f;
+  float cz = (wire.bboxMin[2] + wire.bboxMax[2]) * 0.5f;
+  wire.transform = {1,0,0,0, 0,1,0,0, 0,0,1,0, cx,cy,cz,1};
+
+  OsgSceneObject* sceneObj = scene_.createSceneObject(wire, scene_.getLayer("metal1"));
+  scene_.addObject(sceneObj);
+  scene_.setDisplayNamesVisible(true);
+
+  auto translations = getLabelTranslations(scene_.getObjectRoot(), "vwire");
+  ASSERT_GT(translations.size(), 0) << "Expected at least one label transform";
+
+  // Expected Z values in LOCAL coordinates:
+  //   frontZ = 0 (geometry front surface, local Z=0)
+  //   backZ  = zlen (geometry back surface, local Z=zlen)
+  //   zCenter = zlen/2
+  const float zlen = 0.13f;
+  const float frontZ = 0.0f;
+  const float backZ = zlen;
+  const float zCenter = zlen * 0.5f;
+
+  bool foundFrontOrBack = false;
+  bool foundCenter = false;
+  for (const auto& t : translations) {
+    SCOPED_TRACE(::testing::Message() << "label Z=" << t.z());
+    if (std::abs(t.z() - frontZ) < 0.001f || std::abs(t.z() - backZ) < 0.001f) {
+      foundFrontOrBack = true;
+    }
+    if (std::abs(t.z() - zCenter) < 0.001f) {
+      foundCenter = true;
+    }
+    // Every label Z must match front, back, or center
+    EXPECT_TRUE(std::abs(t.z() - frontZ) < 0.001f ||
+                std::abs(t.z() - backZ) < 0.001f ||
+                std::abs(t.z() - zCenter) < 0.001f)
+        << "Label Z=" << t.z() << " does not match any expected value"
+        << " (frontZ=" << frontZ << " backZ=" << backZ << " zCenter=" << zCenter << ")";
+  }
+  EXPECT_TRUE(foundFrontOrBack) << "No front/back labels found (expected for vertical wire)";
+  EXPECT_TRUE(foundCenter) << "No right/left centered labels found (expected for vertical wire)";
+
+  scene_.removeObject(sceneObj);
+}
+
+TEST_F(OsgSceneTest, LabelZPositionOnHorizontalWire) {
+  // Horizontal wire (xlen > ylen, xlen > zlen):
+  //   - Text on Front/Back (Z faces) → Z = -offset / zlen+offset
+  //   - Text on Top/Bottom (Y faces) → Z = zlen/2 (centered)
+  scene_.updateLayer(makeLayer("metal1", 0.065f, 0.13f));
+
+  ObjectRecord wire;
+  wire.objectId = "hwire";
+  wire.type = ObjectType::Wire;
+  wire.displayName = "hnet";
+  wire.layerId = "metal1";
+  wire.hasBbox = true;
+  // xlen=20.0 > ylen=0.2, zlen=0.13
+  wire.bboxMin = {0.0f, 5.0f, 0.0f};
+  wire.bboxMax = {20.0f, 5.2f, 0.13f};
+
+  float cx = (wire.bboxMin[0] + wire.bboxMax[0]) * 0.5f;
+  float cy = (wire.bboxMin[1] + wire.bboxMax[1]) * 0.5f;
+  float cz = (wire.bboxMin[2] + wire.bboxMax[2]) * 0.5f;
+  wire.transform = {1,0,0,0, 0,1,0,0, 0,0,1,0, cx,cy,cz,1};
+
+  OsgSceneObject* sceneObj = scene_.createSceneObject(wire, scene_.getLayer("metal1"));
+  scene_.addObject(sceneObj);
+  scene_.setDisplayNamesVisible(true);
+
+  auto translations = getLabelTranslations(scene_.getObjectRoot(), "hwire");
+  ASSERT_GT(translations.size(), 0) << "Expected at least one label transform";
+
+  const float zlen = 0.13f;
+  // No geometric offset — text sits exactly at the surface
+  const float frontZ = 0.0f;
+  const float backZ = zlen;
+  const float zCenter = zlen * 0.5f;
+
+  bool foundFrontOrBack = false;
+  bool foundCenter = false;
+  for (const auto& t : translations) {
+    if (std::abs(t.z() - frontZ) < 0.001f || std::abs(t.z() - backZ) < 0.001f) {
+      foundFrontOrBack = true;
+    }
+    if (std::abs(t.z() - zCenter) < 0.001f) {
+      foundCenter = true;
+    }
+    EXPECT_TRUE(std::abs(t.z() - frontZ) < 0.001f ||
+                std::abs(t.z() - backZ) < 0.001f ||
+                std::abs(t.z() - zCenter) < 0.001f)
+        << "Label Z=" << t.z() << " does not match any expected value";
+  }
+  EXPECT_TRUE(foundFrontOrBack) << "No front/back labels found (expected for horizontal wire)";
+  EXPECT_TRUE(foundCenter) << "No top/bottom centered labels found (expected for horizontal wire)";
+
+  scene_.removeObject(sceneObj);
+}
+
+TEST_F(OsgSceneTest, LabelZPositionMatchesGeometrySurface) {
+  // Verify Front/Back text world Z matches the actual geometry surface.
+  // Text sits exactly at the surface (Z-fighting prevented by PolygonOffset).
+  // Front face at local Z=0 = world Z=centerZ.
+  // Back face at local Z=zlen = world Z=centerZ+zlen.
+  scene_.updateLayer(makeLayer("metal2", 0.5f, 0.3f));
+
+  ObjectRecord wire;
+  wire.objectId = "surface_wire";
+  wire.type = ObjectType::Wire;
+  wire.displayName = "surf_net";
+  wire.layerId = "metal2";
+  wire.hasBbox = true;
+  wire.bboxMin = {0.0f, 0.0f, 0.5f};
+  wire.bboxMax = {10.0f, 0.2f, 0.8f};  // zlen=0.3
+
+  float cx = (wire.bboxMin[0] + wire.bboxMax[0]) * 0.5f;  // 5.0
+  float cy = (wire.bboxMin[1] + wire.bboxMax[1]) * 0.5f;  // 0.1
+  float cz = (wire.bboxMin[2] + wire.bboxMax[2]) * 0.5f;  // 0.65
+  wire.transform = {1,0,0,0, 0,1,0,0, 0,0,1,0, cx,cy,cz,1};
+
+  OsgSceneObject* sceneObj = scene_.createSceneObject(wire, scene_.getLayer("metal2"));
+  scene_.addObject(sceneObj);
+  scene_.setDisplayNamesVisible(true);
+
+  auto translations = getLabelTranslations(scene_.getObjectRoot(), "surface_wire");
+  ASSERT_GT(translations.size(), 0);
+
+  const float zlen = 0.3f;
+  const float frontZ_local = 0.0f;    // at the geometry front surface
+  const float backZ_local = zlen;      // at the geometry back surface
+
+  // Front text local Z = 0
+  // Front text world Z = cz + 0 = cz
+  // Geometry front surface world Z = cz (local Z=0) → exact match
+  bool foundFront = false;
+  bool foundBack = false;
+  for (const auto& t : translations) {
+    if (std::abs(t.z() - frontZ_local) < 0.001f) {
+      foundFront = true;
+      float frontWorldZ = cz + t.z();
+      float geomFrontWorldZ = cz;
+      EXPECT_NEAR(frontWorldZ, geomFrontWorldZ, 0.001f)
+          << "Front text should be exactly at geometry front surface";
+    }
+    if (std::abs(t.z() - backZ_local) < 0.001f) {
+      foundBack = true;
+      float backWorldZ = cz + t.z();
+      float geomBackWorldZ = cz + zlen;
+      EXPECT_NEAR(backWorldZ, geomBackWorldZ, 0.001f)
+          << "Back text should be exactly at geometry back surface";
+    }
+  }
+  EXPECT_TRUE(foundFront) << "No front label found (Z=" << frontZ_local << ")";
+  EXPECT_TRUE(foundBack) << "No back label found (Z=" << backZ_local << ")";
+
+  scene_.removeObject(sceneObj);
+}
+
 }  // namespace test
 }  // namespace backend_osg
 }  // namespace render

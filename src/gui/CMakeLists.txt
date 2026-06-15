@@ -9,6 +9,9 @@ option(BUILD_GUI "Build the GUI" ON)
 find_package(Qt5 QUIET COMPONENTS Core Widgets Charts)
 find_package(OpenGL REQUIRED)
 
+# OpenSceneGraph for 3D viewer
+find_package(OpenSceneGraph QUIET COMPONENTS osgViewer osgDB osgUtil osgGA osgShadow)
+
 include("openroad")
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
@@ -97,6 +100,14 @@ if (Qt5_FOUND AND BUILD_GUI)
   )
   target_compile_options(gui PRIVATE "-fno-lto")
   target_link_options(gui PRIVATE "-fno-lto")
+
+  # OpenROAD 3D Viewer (standalone)
+  if(OpenSceneGraph_FOUND)
+    message(STATUS "OpenROAD 3D Viewer enabled")
+    add_subdirectory(openroad3D)
+  else()
+    message(STATUS "OpenSceneGraph not found.3D Viewer is disabled")
+  endif()
 
 messages(
   TARGET gui

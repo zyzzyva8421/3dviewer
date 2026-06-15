@@ -88,11 +88,26 @@ void OpenRoad3DWindow::setupUi() {
   toolbarLayout->addWidget(showInstCheck_);
   toolbarLayout->addWidget(showWireCheck_);
   toolbarLayout->addWidget(showViaCheck_);
+
+  showBlkCheck_ = new QCheckBox("Blk", mainArea);
+  showBlkCheck_->setChecked(true);
+  toolbarLayout->addWidget(showBlkCheck_);
+  showDrcCheck_ = new QCheckBox("DRC", mainArea);
+  showDrcCheck_->setChecked(true);
+  toolbarLayout->addWidget(showDrcCheck_);
+  showTrackCheck_ = new QCheckBox("Trk", mainArea);
+  showTrackCheck_->setChecked(true);
+  toolbarLayout->addWidget(showTrackCheck_);
+
   toolbarLayout->addSpacing(8);
   toolbarLayout->addWidget(new QLabel("Names:", mainArea));
   showNamesCheck_ = new QCheckBox("Show", mainArea);
   showNamesCheck_->setChecked(true);  // Default to showing names
   toolbarLayout->addWidget(showNamesCheck_);
+
+  showStippleCheck_ = new QCheckBox("Stipple", mainArea);
+  showStippleCheck_->setChecked(false);  // Default OFF
+  toolbarLayout->addWidget(showStippleCheck_);
   toolbarLayout->addStretch();
   toolbarLayout->addWidget(statusLabel_);
 
@@ -222,9 +237,17 @@ void OpenRoad3DWindow::setupUi() {
   connect(showInstCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
   connect(showWireCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
   connect(showViaCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
+  connect(showBlkCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
+  connect(showDrcCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
+  connect(showTrackCheck_, &QCheckBox::toggled, this, &OpenRoad3DWindow::applyObjectFilters);
   connect(showNamesCheck_, &QCheckBox::toggled, this, [this](bool checked) {
     if (backend_) {
       backend_->setDisplayNamesVisible(checked);
+    }
+  });
+  connect(showStippleCheck_, &QCheckBox::toggled, this, [this](bool checked) {
+    if (backend_) {
+      backend_->setStippleVisible(checked);
     }
   });
 
@@ -474,34 +497,37 @@ void OpenRoad3DWindow::applyObjectFilters() {
     return;
   }
 
-  // Filter objects by type based on checkboxes.
-  // Do not alter geometry fields (e.g., hasBbox) for visibility control.
-  std::vector<viewer3d::domain::ObjectRecord> changedObjects;
-  changedObjects.reserve(snapshot_.objects.size());
+  // Apply visibility changes directly via backend to avoid snapshot mismatch.
+  std::vector<std::pair<std::string, bool>> visibilityUpdates;
   for (auto& obj : snapshot_.objects) {
-    const bool oldVisible = obj.visible;
+    bool newVisible = obj.visible;
     switch (obj.type) {
       case viewer3d::domain::ObjectType::Inst:
-        obj.visible = showInstCheck_->isChecked();
+        newVisible = showInstCheck_->isChecked();
         break;
       case viewer3d::domain::ObjectType::Wire:
-        obj.visible = showWireCheck_->isChecked();
+        newVisible = showWireCheck_->isChecked();
         break;
       case viewer3d::domain::ObjectType::Via:
-        obj.visible = showViaCheck_->isChecked();
+        newVisible = showViaCheck_->isChecked();
+        break;
+      case viewer3d::domain::ObjectType::Blockage:
+        newVisible = showBlkCheck_->isChecked();
+        break;
+      case viewer3d::domain::ObjectType::Drc:
+        newVisible = showDrcCheck_->isChecked();
+        break;
+      case viewer3d::domain::ObjectType::Track:
+        newVisible = showTrackCheck_->isChecked();
         break;
       default:
-        obj.visible = true;
+        newVisible = true;
         break;
     }
-
-    if (obj.visible != oldVisible) {
-      changedObjects.push_back(obj);
+    if (newVisible != obj.visible) {
+      obj.visible = newVisible;
+      backend_->setObjectVisible(obj.objectId, newVisible);
     }
-  }
-
-  if (!changedObjects.empty()) {
-    backend_->updateObjects(changedObjects);
   }
 }
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2019-2025, The OpenROAD Authors
-
+set(LINK_TIME_OPTIMIZATION OFF CACHE BOOL "Disable LTO" FORCE)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "Disable IPO" FORCE)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/src/cmake")
 
 # The location used by etc/DependencyInstaller.sh
@@ -264,7 +265,9 @@ add_subdirectory(rsz)
 add_subdirectory(tst)
 add_subdirectory(stt)
 add_subdirectory(gpl)
+add_subdirectory(xgp)
 add_subdirectory(dpl)
+add_subdirectory(xdp)
 add_subdirectory(exa)
 add_subdirectory(fin)
 add_subdirectory(ram)
@@ -321,13 +324,19 @@ target_compile_features(openroad PUBLIC cxx_std_20)
 target_include_directories(openroad
   PUBLIC
     ../include
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/xgp/include
 )
 
 target_link_libraries(openroad
   ifp
   pad
   ord
+  xdp
   gpl
+  xgp_lib
+  xgp
+
   dpl
   exa
   fin
@@ -360,7 +369,7 @@ target_link_libraries(openroad
   est
   absl::synchronization
   ${ABC_LIBRARY}
-  ${TCL_LIBRARY}
+  xdp
   ${CMAKE_THREAD_LIBS_INIT}
   ${Boost_LIBRARIES}
 )

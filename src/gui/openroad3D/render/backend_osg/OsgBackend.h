@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <unordered_map>
 
 #include <QWidget>
 #include <QPointer>
@@ -111,6 +112,13 @@ class OsgBackend : public IRenderBackend {
   
   void setDisplayNamesVisible(bool visible) override;
   bool isDisplayNamesVisible() const override;
+  void setStippleVisible(bool visible) override;
+  bool isStippleVisible() const override;
+  void setObjectVisible(const std::string& objectId, bool visible) override;
+  bool isObjectVisible(const std::string& objectId) const override;
+  std::string objectIdAtScreen(float nx, float ny) const override;
+  void setHeightScale(float scale) override;
+  float heightScale() const override;
 
  private:
   friend class OsgViewWidget;
@@ -170,11 +178,16 @@ class OsgBackend : public IRenderBackend {
   void handleMouseRelease(QMouseEvent* event);
   void handleWheel(QWheelEvent* event);
   void handleKeyPress(QKeyEvent* event);
+  void handleContextMenu(QContextMenuEvent* event);
   void drawOverlay(class QPainter& painter, const QSize& size) const;
   void updateSelection(const std::string& objectId);
   bool pickObjectAt(const QPoint& pos, const QSize& size, std::string* objectId, osg::Vec3* worldPoint) const;
   QPointF projectPoint(const osg::Vec3& worldPoint, const QSize& size) const;
   bool objectScreenBounds(const domain::ObjectRecord& object, const QSize& size, QRectF* bounds, osg::Vec3* center) const;
+
+  // O(1) lookup helpers using index maps
+  const domain::ObjectRecord* findObjectById(const std::string& objectId) const;
+  const domain::LayerRecord* findLayerById(const std::string& layerId) const;
 
   // English comment.
   
@@ -233,8 +246,16 @@ class OsgBackend : public IRenderBackend {
   bool isEditing_ = false;
   bool isEditingRotating_ = false;
   
+  float heightScale_ = 1.0f;
+
   // English comment.
   RenderProfile profile_ = RenderProfile::Modern;
+
+  // Index maps for O(1) object/layer lookup (built in loadScene)
+  mutable std::unordered_map<std::string, const domain::ObjectRecord*> objectIndex_;
+  mutable std::unordered_map<std::string, const domain::LayerRecord*> layerIndex_;
+  int lastViewWidth_ = 0;
+  int lastViewHeight_ = 0;
 };
 
 }  // namespace backend_osg

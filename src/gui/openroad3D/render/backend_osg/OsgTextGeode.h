@@ -27,8 +27,10 @@ public:
      * @param text Text string to render
      * @param fontAtlas Font atlas containing glyph data
      * @param color Text color (used for vertex colors)
+     * @param flipY If true, negate vertex Y to flip text orientation (for faces where text appears upside-down)
+     * @param scale Scale factor for text (default 1.0 = no scaling, applied to vertices)
      */
-    OsgTextGeode(const std::string& text, OsgFontAtlas* fontAtlas, const osg::Vec4& color);
+    OsgTextGeode(const std::string& text, OsgFontAtlas* fontAtlas, const osg::Vec4& color, float scale = 1.0f);
     
     virtual ~OsgTextGeode() {}
     
@@ -39,6 +41,7 @@ public:
     
 private:
     osg::Vec4 color_;
+    float scale_;
 };
 
 }  // namespace backend_osg

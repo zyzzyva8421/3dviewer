@@ -71,7 +71,11 @@ class OpenRoad3DWindow : public QMainWindow {
   QCheckBox* showInstCheck_;
   QCheckBox* showWireCheck_;
   QCheckBox* showViaCheck_;
+  QCheckBox* showBlkCheck_;
+  QCheckBox* showDrcCheck_;
+  QCheckBox* showTrackCheck_;
   QCheckBox* showNamesCheck_;
+  QCheckBox* showStippleCheck_;
 
   // Tool buttons
   QPushButton* navigateButton_;

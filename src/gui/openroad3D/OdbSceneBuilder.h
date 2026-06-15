@@ -37,8 +37,14 @@ class OdbSceneBuilder {
   // Process all block terminals (pins)
   void processPins(viewer3d::domain::SceneSnapshot& snapshot);
 
-  // Process all vias
-  void processVias(viewer3d::domain::SceneSnapshot& snapshot);
+  // Process blockages
+  void processBlockages(viewer3d::domain::SceneSnapshot& snapshot);
+
+  // Process DRC markers
+  void processDrcMarkers(viewer3d::domain::SceneSnapshot& snapshot);
+
+  // Process track grids
+  void processTrackGrids(viewer3d::domain::SceneSnapshot& snapshot);
 
   // Create or get a layer record for the given layer name
   viewer3d::domain::LayerRecord* getOrCreateLayer(

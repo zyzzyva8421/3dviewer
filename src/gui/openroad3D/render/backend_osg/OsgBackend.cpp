@@ -8,6 +8,9 @@
 #include <limits>
 #include <sstream>
 #include <unordered_map>
+
+#include <QContextMenuEvent>
+#include <QMenu>
 #include <unordered_set>
 
 #include <QColor>
@@ -136,6 +139,25 @@ class OsgViewportWidget final : public QWidget {
 
   void mouseMoveEvent(QMouseEvent* event) override {
     if (backend_) {
+      // Tooltip: pick object under cursor when not dragging
+      if (!(event->buttons() & Qt::MouseButtonMask)) {
+        QSize size = rect().size();
+        std::string objId;
+        osg::Vec3 worldPt;
+        if (backend_->pickObjectAt(event->pos(), size, &objId, &worldPt)) {
+          std::string tip;
+          for (const auto& obj : backend_->snapshot_.objects) {
+            if (obj.objectId == objId) {
+              tip = obj.displayName.empty() ? objId : obj.displayName;
+              tip += " [" + obj.layerId + "]";
+              break;
+            }
+          }
+          if (!tip.empty()) setToolTip(QString::fromStdString(tip));
+        } else {
+          setToolTip("");
+        }
+      }
       backend_->handleMouseMove(event);
     }
     QWidget::mouseMoveEvent(event);
@@ -155,6 +177,13 @@ class OsgViewportWidget final : public QWidget {
     QWidget::wheelEvent(event);
   }
 
+  void contextMenuEvent(QContextMenuEvent* event) override {
+    if (backend_) {
+      backend_->handleContextMenu(event);
+    }
+    QWidget::contextMenuEvent(event);
+  }
+
   void keyPressEvent(QKeyEvent* event) override {
     if (backend_) {
       backend_->handleKeyPress(event);
@@ -170,23 +199,16 @@ class OsgViewportWidget final : public QWidget {
 
 namespace {
 
-const domain::LayerRecord* findLayerRecord(const domain::SceneSnapshot& snapshot,
-                                           const std::string& layerId) {
-  for (const auto& layer : snapshot.layers) {
-    if (layer.layerId == layerId) {
-      return &layer;
-    }
-  }
+// These are now O(1) via index maps in OsgBackend
+const domain::LayerRecord* findLayerRecord(const domain::SceneSnapshot& /*snapshot*/,
+                                           const std::string& /*layerId*/) {
+  // Deprecated: use objectIndex_/layerIndex_ in OsgBackend instead
   return nullptr;
 }
 
-const domain::ObjectRecord* findObjectRecord(const domain::SceneSnapshot& snapshot,
-                                             const std::string& objectId) {
-  for (const auto& object : snapshot.objects) {
-    if (object.objectId == objectId) {
-      return &object;
-    }
-  }
+const domain::ObjectRecord* findObjectRecord(const domain::SceneSnapshot& /*snapshot*/,
+                                             const std::string& /*objectId*/) {
+  // Deprecated: use objectIndex_/layerIndex_ in OsgBackend instead
   return nullptr;
 }
 
@@ -369,7 +391,22 @@ void OsgBackend::loadScene(const domain::SceneSnapshot& snapshot) {
     return;
   }
 
+  // Build index maps for O(1) lookup
+  objectIndex_.clear();
+  objectIndex_.reserve(snapshot_.objects.size());
+  for (const auto& obj : snapshot_.objects) {
+    objectIndex_[obj.objectId] = &obj;
+  }
+
+  layerIndex_.clear();
+  layerIndex_.reserve(snapshot_.layers.size());
+  for (const auto& layer : snapshot_.layers) {
+    layerIndex_[layer.layerId] = &layer;
+  }
+
   scene_->loadSnapshot(snapshot_);
+  fprintf(stderr, "DEBUG loadScene: loaded %zu objects, %zu layers\n",
+          scene_->getObjectCount(), snapshot_.layers.size());
   clearSelection();
   fitToScene();
   requestRedraw();
@@ -424,6 +461,8 @@ void OsgBackend::updateObjects(const std::vector<domain::ObjectRecord>& objects)
     if (found == objectIndexById.end()) {
       snapshot_.objects.push_back(object);
       objectIndexById[object.objectId] = snapshot_.objects.size() - 1;
+      // Also update the index map for O(1) lookup
+      objectIndex_[object.objectId] = &snapshot_.objects.back();
       fullUpdates.push_back(object);
     } else {
       auto& existing = snapshot_.objects[found->second];
@@ -433,6 +472,8 @@ void OsgBackend::updateObjects(const std::vector<domain::ObjectRecord>& objects)
       } else {
         existing = object;
         fullUpdates.push_back(object);
+        // Update index map pointer
+        objectIndex_[object.objectId] = &existing;
       }
     }
   }
@@ -651,6 +692,53 @@ bool OsgBackend::isDisplayNamesVisible() const {
   return false;
 }
 
+void OsgBackend::setStippleVisible(bool visible) {
+  if (scene_) {
+    scene_->setStippleVisible(visible);
+  }
+  requestRedraw();
+}
+
+bool OsgBackend::isStippleVisible() const {
+  if (scene_) {
+    return scene_->isStippleVisible();
+  }
+  return false;
+}
+
+void OsgBackend::setObjectVisible(const std::string& objectId, bool visible) {
+  if (scene_) {
+    scene_->setObjectVisible(objectId, visible);
+  }
+  requestRedraw();
+}
+
+bool OsgBackend::isObjectVisible(const std::string& objectId) const {
+  if (scene_) {
+    return scene_->isObjectVisible(objectId);
+  }
+  return true;
+}
+
+std::string OsgBackend::objectIdAtScreen(float nx, float ny) const {
+  if (scene_) {
+    return scene_->findObjectIdAtScreen(nx, ny);
+  }
+  return "";
+}
+
+void OsgBackend::setHeightScale(float scale) {
+  heightScale_ = std::max(0.1f, scale);
+  // Rebuild scene with new scale factor
+  if (!snapshot_.objects.empty()) {
+    loadScene(snapshot_);
+  }
+}
+
+float OsgBackend::heightScale() const {
+  return heightScale_;
+}
+
 void OsgBackend::createSceneGraph() {
   if (!root_) {
     root_ = new osg::Group();
@@ -754,7 +842,11 @@ void OsgBackend::fitToScene() {
           minPoint.x, minPoint.y, minPoint.z,
           maxPoint.x, maxPoint.y, maxPoint.z,
           center_.x(), center_.y(), center_.z());
-  const float extent = std::max({maxPoint.x - minPoint.x, maxPoint.y - minPoint.y, maxPoint.z - minPoint.z, 1.0F});
+  // Clamp Z range to a reasonable value (chip layers typically < 50 units).
+  // Some objects (e.g., DRC markers with null-layer fallback) can produce
+  // extreme Z values that blow up the bbox.
+  const float zExtent = std::min(maxPoint.z - minPoint.z, 50.0f);
+  const float extent = std::max({maxPoint.x - minPoint.x, maxPoint.y - minPoint.y, zExtent, 1.0F});
   distance_ = std::max(8.0F, extent * 1.7F);
   applyViewTransformation();
 }
@@ -967,7 +1059,46 @@ void OsgBackend::handleWheel(QWheelEvent* event) {
   requestRedraw();
 }
 
+void OsgBackend::handleContextMenu(QContextMenuEvent* event) {
+  // Find object under cursor
+  QPoint pos = event->pos();
+  QSize size = viewWidget_ ? viewWidget_->size() : QSize(640, 420);
+  std::string objId;
+  osg::Vec3 worldPt;
+  if (!pickObjectAt(pos, size, &objId, &worldPt)) {
+    return;  // No object clicked
+  }
+
+  // Look up object info
+  std::string displayName = objId;
+  std::string layerName;
+  for (const auto& obj : snapshot_.objects) {
+    if (obj.objectId == objId) {
+      displayName = obj.displayName.empty() ? objId : obj.displayName;
+      layerName = obj.layerId;
+      break;
+    }
+  }
+
+  QMenu menu;
+  menu.addAction(QString("Object: %1").arg(QString::fromStdString(displayName)));
+  menu.addAction(QString("Layer: %1").arg(QString::fromStdString(layerName)));
+  menu.addSeparator();
+
+  bool isHidden = !isObjectVisible(objId);
+  QAction* hideAction = menu.addAction(isHidden ? "Show" : "Hide");
+  if (hideAction) {
+    QAction* chosen = menu.exec(event->globalPos());
+    if (chosen == hideAction) {
+      setObjectVisible(objId, isHidden);
+    }
+  }
+}
+
 void OsgBackend::handleKeyPress(QKeyEvent* event) {
+  const float panStep = distance_ * 0.05f;
+  const float heightStep = 0.1f;
+
   switch (event->key()) {
     case Qt::Key_1:
       setAnchorView(AnchorView::Front);
@@ -996,12 +1127,41 @@ void OsgBackend::handleKeyPress(QKeyEvent* event) {
     case Qt::Key_Left:
       if (event->modifiers() & Qt::AltModifier) {
         goPreviousView();
+      } else {
+        center_.x() -= panStep;
+        applyViewTransformation();
+        requestRedraw();
       }
       break;
     case Qt::Key_Right:
       if (event->modifiers() & Qt::AltModifier) {
         goNextView();
+      } else {
+        center_.x() += panStep;
+        applyViewTransformation();
+        requestRedraw();
       }
+      break;
+    case Qt::Key_Up:
+      if (!(event->modifiers() & Qt::AltModifier)) {
+        center_.y() += panStep;
+        applyViewTransformation();
+        requestRedraw();
+      }
+      break;
+    case Qt::Key_Down:
+      if (!(event->modifiers() & Qt::AltModifier)) {
+        center_.y() -= panStep;
+        applyViewTransformation();
+        requestRedraw();
+      }
+      break;
+    case Qt::Key_Plus:
+    case Qt::Key_Equal:
+      setHeightScale(heightScale_ + heightStep);
+      break;
+    case Qt::Key_Minus:
+      setHeightScale(heightScale_ - heightStep);
       break;
     case Qt::Key_0:
       if (event->modifiers() & Qt::AltModifier) {
@@ -1054,7 +1214,7 @@ void OsgBackend::drawOverlay(QPainter& painter, const QSize& size) const {
 
   if (!selectedObjectId_.empty()) {
     std::string selectionText = selectedObjectId_;
-    if (const domain::ObjectRecord* selected = findObjectRecord(snapshot_, selectedObjectId_)) {
+    if (const domain::ObjectRecord* selected = findObjectById(selectedObjectId_)) {
       std::string name = selected->displayName;
       if (name.empty() &&
           (selected->type == domain::ObjectType::Wire || selected->type == domain::ObjectType::Via)) {
@@ -1128,12 +1288,17 @@ bool OsgBackend::pickObjectAt(const QPoint& pos,
             candidateId.erase(candidateId.size() - geodeSuffix.size());
           }
 
-          const domain::ObjectRecord* objectRecord = findObjectRecord(snapshot_, candidateId);
+          const domain::ObjectRecord* objectRecord = findObjectById(candidateId);
           if (!objectRecord) {
             continue;
           }
 
-          const domain::LayerRecord* layer = findLayerRecord(snapshot_, objectRecord->layerId);
+          // Skip invisible objects
+          if (!objectRecord->visible) {
+            continue;
+          }
+
+          const domain::LayerRecord* layer = findLayerById(objectRecord->layerId);
           if (layer && (!layer->visible || !layer->selectable)) {
             continue;
           }
@@ -1158,7 +1323,12 @@ bool OsgBackend::pickObjectAt(const QPoint& pos,
   osg::Vec3 bestCenter;
 
   for (const auto& object : snapshot_.objects) {
-    const domain::LayerRecord* layer = findLayerRecord(snapshot_, object.layerId);
+    // Skip invisible objects
+    if (!object.visible) {
+      continue;
+    }
+
+    const domain::LayerRecord* layer = findLayerById(object.layerId);
     if (layer && (!layer->visible || !layer->selectable)) {
       continue;
     }
@@ -1380,9 +1550,31 @@ void OsgBackend::renderFrame() {
     return;
   }
 
-  updateViewport(glViewWidget_ ? glViewWidget_->width() : 1,
-                 glViewWidget_ ? glViewWidget_->height() : 1);
+  // Only update viewport if size actually changed
+  int width = glViewWidget_ ? glViewWidget_->width() : 1;
+  int height = glViewWidget_ ? glViewWidget_->height() : 1;
+  if (width != lastViewWidth_ || height != lastViewHeight_) {
+    lastViewWidth_ = width;
+    lastViewHeight_ = height;
+    updateViewport(width, height);
+  }
   viewer_->frame();
+}
+
+const domain::ObjectRecord* OsgBackend::findObjectById(const std::string& objectId) const {
+  auto it = objectIndex_.find(objectId);
+  if (it != objectIndex_.end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
+const domain::LayerRecord* OsgBackend::findLayerById(const std::string& layerId) const {
+  auto it = layerIndex_.find(layerId);
+  if (it != layerIndex_.end()) {
+    return it->second;
+  }
+  return nullptr;
 }
 
 }  // namespace backend_osg

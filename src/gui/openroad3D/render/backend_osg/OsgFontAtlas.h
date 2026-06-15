@@ -67,7 +67,7 @@ public:
     // Atlas dimensions
     static constexpr uint32_t ATLAS_WIDTH = 1024;
     static constexpr uint32_t ATLAS_HEIGHT = 1024;
-    static constexpr uint32_t FONT_SIZE = 40;
+    static constexpr int FONT_SIZE = 40;
     static constexpr uint32_t FIRST_CHAR = ' ';
     static constexpr uint32_t CHAR_COUNT = '~' - ' ' + 1;
 
