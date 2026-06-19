@@ -190,7 +190,7 @@ void OpenRoad3DWindow::setupUi() {
       viewLayout_->addWidget(currentView_);
     }
     backend_->setToolMode(currentToolMode_);
-    backend_->setDisplayNamesVisible(true);  // Enable display names by default
+    // Display names enabled after first scene load based on object count.
   }
 
   // Connect signals - tools
@@ -267,8 +267,11 @@ void OpenRoad3DWindow::refreshView() {
   // Build scene from database
   viewer3d::domain::SceneSnapshot newSnapshot = sceneBuilder_->build();
 
-  // Update backend with new scene
+  // Enable display names only for small designs (< 50K objects)
+  // to avoid creating 6+ OSG nodes per object for text labels and stipple quads.
   if (backend_) {
+    bool smallDesign = newSnapshot.objects.size() < 50000;
+    backend_->setDisplayNamesVisible(smallDesign);
     if (!sceneLoaded_) {
       snapshot_ = std::move(newSnapshot);
       backend_->loadScene(snapshot_);

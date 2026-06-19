@@ -199,19 +199,6 @@ class OsgViewportWidget final : public QWidget {
 
 namespace {
 
-// These are now O(1) via index maps in OsgBackend
-const domain::LayerRecord* findLayerRecord(const domain::SceneSnapshot& /*snapshot*/,
-                                           const std::string& /*layerId*/) {
-  // Deprecated: use objectIndex_/layerIndex_ in OsgBackend instead
-  return nullptr;
-}
-
-const domain::ObjectRecord* findObjectRecord(const domain::SceneSnapshot& /*snapshot*/,
-                                             const std::string& /*objectId*/) {
-  // Deprecated: use objectIndex_/layerIndex_ in OsgBackend instead
-  return nullptr;
-}
-
 const char* objectTypeText(domain::ObjectType type) {
   switch (type) {
     case domain::ObjectType::Wire:
@@ -387,6 +374,13 @@ void OsgBackend::shutdown() {
 
 void OsgBackend::loadScene(const domain::SceneSnapshot& snapshot) {
   snapshot_ = snapshot;
+  // ============================================================
+  // MEMORY OPTIMIZATION: Pre-reserve vector capacity
+  // ============================================================
+  // OsgScene::pendingObjects_ points into snapshot_.objects. Incremental
+  // updateObjects() may push_back new records; pre-reserving prevents
+  // vector reallocation which would invalidate scene-side pointers.
+  snapshot_.objects.reserve(snapshot_.objects.size() + 10000);
   if (!scene_) {
     return;
   }
@@ -405,10 +399,19 @@ void OsgBackend::loadScene(const domain::SceneSnapshot& snapshot) {
   }
 
   scene_->loadSnapshot(snapshot_);
-  fprintf(stderr, "DEBUG loadScene: loaded %zu objects, %zu layers\n",
-          scene_->getObjectCount(), snapshot_.layers.size());
   clearSelection();
   fitToScene();
+
+  // Update frustum and load visible objects after fitToScene
+  if (scene_) {
+    osg::Matrixd viewMat = camera_->getViewMatrix();
+    osg::Matrixd projMat = camera_->getProjectionMatrix();
+    scene_->updateFrustum(viewMat.ptr(), projMat.ptr());
+    scene_->ensureObjectsInFrustum();
+    fprintf(stderr, "DEBUG loadScene: loaded %zu / %zu objects, %zu layers\n",
+            scene_->getLoadedObjectCount(), scene_->getTotalObjectCount(), snapshot_.layers.size());
+  }
+
   requestRedraw();
 }
 
@@ -1270,47 +1273,82 @@ bool OsgBackend::pickObjectAt(const QPoint& pos,
     camera_->accept(visitor);
 
     if (intersector->containsIntersections()) {
+      // Collect all valid candidates with their distance (ratio) for sorting
+      std::vector<std::tuple<std::string, float, osg::Vec3>> candidates;
       for (const auto& hit : intersector->getIntersections()) {
-        for (auto nodeIt = hit.nodePath.rbegin(); nodeIt != hit.nodePath.rend(); ++nodeIt) {
-          osg::Node* node = *nodeIt;
-          if (!node) {
-            continue;
-          }
+        std::string candidateId;
 
-          std::string candidateId = node->getName();
-          if (candidateId.empty()) {
-            continue;
+        // Check if this is a batched geometry hit (geode named "batch_*")
+        osg::Geode* geode = hit.nodePath.empty() ? nullptr
+            : dynamic_cast<osg::Geode*>(hit.nodePath.back());
+        if (geode) {
+          const std::string& geodeName = geode->getName();
+          if (geodeName.find("batch_") == 0) {
+            // Batched geometry: use findBatchObjectId to get actual objectId
+            const std::string* batchId = scene_->findBatchObjectId(geode, static_cast<uint32_t>(hit.primitiveIndex));
+            if (batchId) {
+              candidateId = *batchId;
+            }
           }
-
-          const std::string geodeSuffix = ":geode";
-          if (candidateId.size() > geodeSuffix.size() &&
-              candidateId.compare(candidateId.size() - geodeSuffix.size(), geodeSuffix.size(), geodeSuffix) == 0) {
-            candidateId.erase(candidateId.size() - geodeSuffix.size());
-          }
-
-          const domain::ObjectRecord* objectRecord = findObjectById(candidateId);
-          if (!objectRecord) {
-            continue;
-          }
-
-          // Skip invisible objects
-          if (!objectRecord->visible) {
-            continue;
-          }
-
-          const domain::LayerRecord* layer = findLayerById(objectRecord->layerId);
-          if (layer && (!layer->visible || !layer->selectable)) {
-            continue;
-          }
-
-          if (objectId) {
-            *objectId = candidateId;
-          }
-          if (worldPoint) {
-            *worldPoint = hit.getWorldIntersectPoint();
-          }
-          return true;
         }
+
+        // If not from batch, try node path scan (original logic)
+        if (candidateId.empty()) {
+          for (auto nodeIt = hit.nodePath.rbegin(); nodeIt != hit.nodePath.rend(); ++nodeIt) {
+            osg::Node* node = *nodeIt;
+            if (!node) {
+              continue;
+            }
+
+            candidateId = node->getName();
+            if (candidateId.empty()) {
+              continue;
+            }
+
+            const std::string geodeSuffix = ":geode";
+            if (candidateId.size() > geodeSuffix.size() &&
+                candidateId.compare(candidateId.size() - geodeSuffix.size(), geodeSuffix.size(), geodeSuffix) == 0) {
+              candidateId.erase(candidateId.size() - geodeSuffix.size());
+            }
+            break;
+          }
+        }
+
+        if (candidateId.empty()) {
+          continue;
+        }
+
+        const domain::ObjectRecord* objectRecord = findObjectById(candidateId);
+        if (!objectRecord) {
+          continue;
+        }
+
+        // Skip invisible objects
+        if (!objectRecord->visible) {
+          continue;
+        }
+
+        const domain::LayerRecord* layer = findLayerById(objectRecord->layerId);
+        if (layer && (!layer->visible || !layer->selectable)) {
+          continue;
+        }
+
+        candidates.emplace_back(candidateId, hit.ratio, hit.getWorldIntersectPoint());
+      }
+
+      // Sort by ratio (distance along ray) - smaller is closer
+      if (!candidates.empty()) {
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) {
+              return std::get<1>(a) < std::get<1>(b);
+            });
+        if (objectId) {
+          *objectId = std::get<0>(candidates[0]);
+        }
+        if (worldPoint) {
+          *worldPoint = std::get<2>(candidates[0]);
+        }
+        return true;
       }
     }
   }
@@ -1392,7 +1430,7 @@ bool OsgBackend::objectScreenBounds(const domain::ObjectRecord& object,
     return false;
   }
 
-  const domain::LayerRecord* layer = findLayerRecord(snapshot_, object.layerId);
+  const domain::LayerRecord* layer = findLayerById(object.layerId);
   const auto corners = objectCorners(object, layer);
   float minX = std::numeric_limits<float>::max();
   float minY = std::numeric_limits<float>::max();
@@ -1558,6 +1596,34 @@ void OsgBackend::renderFrame() {
     lastViewHeight_ = height;
     updateViewport(width, height);
   }
+
+  // Throttle frustum updates to reduce overhead during interaction
+  bool needsFrustumUpdate = false;
+  if (scene_ && scene_->isFrustumCullingEnabled()) {
+    int currentFrame = lastFrustumUpdateFrame_ + 1;
+    float distChange = std::abs(distance_ - lastFrustumUpdateDistance_);
+    osg::Vec3 centerDiff = center_ - lastFrustumUpdateCenter_;
+
+    if (currentFrame >= FRUSTUM_UPDATE_INTERVAL_FRAMES ||
+        distChange > FRUSTUM_UPDATE_THRESHOLD ||
+        centerDiff.length() > FRUSTUM_UPDATE_THRESHOLD) {
+      needsFrustumUpdate = true;
+      lastFrustumUpdateFrame_ = 0;
+      lastFrustumUpdateDistance_ = distance_;
+      lastFrustumUpdateCenter_ = center_;
+    } else {
+      lastFrustumUpdateFrame_ = currentFrame;
+    }
+  }
+
+  // Update frustum for culling and lazy load visible objects
+  if (needsFrustumUpdate) {
+    osg::Matrixd viewMat = camera_->getViewMatrix();
+    osg::Matrixd projMat = camera_->getProjectionMatrix();
+    scene_->updateFrustum(viewMat.ptr(), projMat.ptr());
+    scene_->ensureObjectsInFrustum();
+  }
+
   viewer_->frame();
 }
 

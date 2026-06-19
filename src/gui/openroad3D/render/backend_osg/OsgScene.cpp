@@ -5,6 +5,7 @@
 #include "OsgMaterial.h"
 #include "OsgTextGeode.h"
 #include "OsgTexture.h"
+#include "SpatialIndex.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -457,7 +458,6 @@ bool OsgScene::initFontAtlas() {
         if (probe.good()) {
             probe.close();
             if (fontAtlas_->initFont(*path)) {
-                fprintf(stderr, "DEBUG: Loaded font: %s\n", *path);
                 return true;
             }
         }
@@ -544,7 +544,243 @@ void OsgScene::clear() {
     textLabelNodes_.clear();
     stippleNodes_.clear();
     objectRecordPtrs_.clear();
+    layerStateSetCache_.clear();
+    pendingObjects_ = nullptr;
+    objectIndexById_.clear();
+    layerBatches_.clear();
+    batchGeodeToKey_.clear();
+    objectIdToBatchKey_.clear();
 }
+
+// ============================================================
+// BATCHING HELPERS
+// ============================================================
+
+void OsgScene::appendBoxToBatch(osg::Vec3Array* verts, osg::Vec3Array* norms,
+                                 osg::DrawElementsUInt* tris,
+                                 float x, float y, float w, float h, float d,
+                                 uint32_t vertOffset, float zOffset) {
+    const float z0 = zOffset, x1 = x + w, y1 = y + h, z1 = zOffset + d;
+    const auto p000 = osg::Vec3(x,y,z0), p100 = osg::Vec3(x1,y,z0);
+    const auto p110 = osg::Vec3(x1,y1,z0), p010 = osg::Vec3(x,y1,z0);
+    const auto p001 = osg::Vec3(x,y,z1), p101 = osg::Vec3(x1,y,z1);
+    const auto p111 = osg::Vec3(x1,y1,z1), p011 = osg::Vec3(x,y1,z1);
+    auto af = [&](const osg::Vec3& a, const osg::Vec3& b, const osg::Vec3& c, const osg::Vec3& d, const osg::Vec3& n) {
+        verts->push_back(a); verts->push_back(b); verts->push_back(c); verts->push_back(d);
+        norms->push_back(n); norms->push_back(n); norms->push_back(n); norms->push_back(n);
+    };
+    af(p000,p100,p110,p010, osg::Vec3(0,0,-1)); af(p001,p011,p111,p101, osg::Vec3(0,0,1));
+    af(p000,p001,p101,p100, osg::Vec3(0,-1,0)); af(p100,p101,p111,p110, osg::Vec3(1,0,0));
+    af(p110,p111,p011,p010, osg::Vec3(0,1,0));  af(p010,p011,p001,p000, osg::Vec3(-1,0,0));
+    for (unsigned f = 0; f < 6; ++f) {
+        unsigned b = vertOffset + f * 4;
+        tris->push_back(b); tris->push_back(b+1); tris->push_back(b+2);
+        tris->push_back(b); tris->push_back(b+2); tris->push_back(b+3);
+    }
+}
+
+void OsgScene::appendWireToBatch(osg::Vec3Array* verts, osg::Vec3Array* norms,
+                                  osg::DrawElementsUInt* tris,
+                                  const domain::ObjectRecord& obj,
+                                  const domain::LayerRecord* /*layer*/,
+                                  uint32_t vertOffset, float zOffset) {
+    // Wire: render as line from bbox center to edge (simple line for debugging).
+    // EDA wires are better represented as boxes (call appendBoxToBatch).
+    if (!obj.hasBbox) return;
+    // Render wire as a box in world coordinates at the layer's Z plane.
+    // XY dimensions come from the wire segment's bbox (typically sub-micron width).
+    float wireW = std::max(.01f, obj.bboxMax[0] - obj.bboxMin[0]);
+    float wireH = std::max(.01f, obj.bboxMax[1] - obj.bboxMin[1]);
+    float wireD = std::max(.01f, obj.bboxMax[2] - obj.bboxMin[2]);
+    // Enforce minimum visible size for EDA layout wires (otherwise sub-micron
+    // wires are invisible at default zoom). Use lineWidth*2 as minimum screen size.
+    // TODO: make minimum configurable
+    float minVisible = 0.02f;
+    if (wireW < minVisible && wireH < minVisible) {
+        wireW = std::max(wireW, minVisible);
+        wireH = std::max(wireH, minVisible);
+    }
+    appendBoxToBatch(verts, norms, tris,
+        obj.bboxMin[0], obj.bboxMin[1], wireW, wireH, wireD, vertOffset, zOffset);
+}
+
+void OsgScene::buildBatches(const domain::SceneSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(batchMutex_);
+    layerBatches_.clear();
+    batchGeodeToKey_.clear();
+    objectIdToBatchKey_.clear();
+    std::unordered_map<std::string, std::vector<const domain::ObjectRecord*>> groups;
+    for (const auto& obj : snapshot.objects) {
+        if (obj.type != domain::ObjectType::Wire && obj.type != domain::ObjectType::Via) continue;
+        auto pit = objectIndexById_.find(obj.objectId);
+        if (pit == objectIndexById_.end()) continue;
+        std::string key = obj.layerId + "_" + std::to_string(static_cast<int>(obj.type));
+        groups[key].push_back(pit->second);
+    }
+    for (auto& [key, objs] : groups) {
+        if (objs.empty()) continue;
+        size_t us = key.find_last_of('_');
+        std::string lid = key.substr(0, us);
+        int ti = std::stoi(key.substr(us + 1));
+        domain::ObjectType ot = static_cast<domain::ObjectType>(ti);
+        const domain::LayerRecord* layer = getLayer(lid);
+        if (!layer) continue;
+        LayerBatch batch;
+        batch.batchKey = key; batch.layerId = lid; batch.type = ot;
+        osg::ref_ptr<osg::Vec3Array> verts(new osg::Vec3Array());
+        osg::ref_ptr<osg::Vec3Array> norms(new osg::Vec3Array());
+        osg::ref_ptr<osg::DrawElementsUInt> tris(new osg::DrawElementsUInt(GL_TRIANGLES));
+        verts->reserve(objs.size() * 24);
+        norms->reserve(objs.size() * 24);
+        tris->reserve(objs.size() * 36);
+        uint32_t tro = 0;
+        int addedCount = 0;
+        for (auto* op : objs) {
+            if (hiddenObjects_.count(op->objectId)) continue;
+            uint32_t tb = tris->size();
+            uint32_t vertOffset = verts->size();
+            if (ot == domain::ObjectType::Via) {
+                // World coordinates (batch geode has no transform)
+                float x = op->bboxMin[0];
+                float y = op->bboxMin[1];
+                float w = std::max(.01f, op->bboxMax[0] - op->bboxMin[0]);
+                float h = std::max(.01f, op->bboxMax[1] - op->bboxMin[1]);
+                float d = std::max(.01f, op->bboxMax[2] - op->bboxMin[2]);
+                appendBoxToBatch(verts.get(), norms.get(), tris.get(), x, y, w, h, d, vertOffset, op->bboxMin[2]);
+            } else {
+                appendWireToBatch(verts.get(), norms.get(), tris.get(), *op, layer, vertOffset, op->bboxMin[2]);
+            }
+            uint32_t nt = (tris->size() - tb) / 3;
+            if (nt > 0) addedCount++;
+            batch.primitives.push_back({op->objectId, tro, nt});
+            batch.objects.push_back(op);
+            objectIdToBatchKey_[op->objectId] = key;
+            // Create placeholder OsgSceneObject for batched objects so raycast/selection can find them
+            // Note: node is nullptr since geometry is in the batch, not individual node
+            if (objectsById_.find(op->objectId) == objectsById_.end()) {
+                OsgSceneObject* placeholderObj = new OsgSceneObject(op->objectId, nullptr);
+                objectsById_[op->objectId] = placeholderObj;
+                objectLayerById_[op->objectId] = lid;
+            }
+            tro += nt;
+        }
+        fprintf(stderr, "DEBUG buildBatches: key=%s objs=%zu added=%d verts=%zu tris=%zu\n",
+                key.c_str(), objs.size(), addedCount, verts->size(), tris->size()/3);
+        if (verts->empty()) continue;
+        batch.geometry = new osg::Geometry();
+        batch.geometry->setVertexArray(verts.get());
+        batch.geometry->setNormalArray(norms.get(), osg::Array::BIND_PER_VERTEX);
+        // Set flat color array for the entire batch (GL_LIGHTING OFF uses this)
+        {
+            osg::Vec4Array* colors = new osg::Vec4Array();
+            colors->push_back(osg::Vec4(layer->color.r, layer->color.g, layer->color.b, 1.0f));
+            batch.geometry->setColorArray(colors, osg::Array::BIND_OVERALL);
+        }
+        batch.geometry->addPrimitiveSet(tris.get());
+        batch.geometry->setUseVertexBufferObjects(true);
+        batch.geode = new osg::Geode();
+        batch.geode->addDrawable(batch.geometry.get());
+        batch.geode->setName("batch_" + key);
+        // Batch flat-shaded StateSet: GL_LIGHTING ON with flat material, depth test ON.
+        // Enable depth test and depth writes so proper occlusion happens.
+        {
+            osg::StateSet* batchSS = new osg::StateSet();
+            batchSS->setMode(GL_LIGHTING, osg::StateAttribute::ON);
+            batchSS->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
+            osg::ref_ptr<osg::Depth> depth = new osg::Depth(osg::Depth::LEQUAL, 0.0, 1.0, true);
+            batchSS->setAttributeAndModes(depth.get(), osg::StateAttribute::ON);
+            // Set up material for flat shading with layer color
+            osg::ref_ptr<osg::Material> mat = new osg::Material();
+            mat->setAmbient(osg::Material::FRONT_AND_BACK, osg::Vec4(0.3f, 0.3f, 0.3f, 1.0f));
+            mat->setDiffuse(osg::Material::FRONT_AND_BACK, osg::Vec4(layer->color.r, layer->color.g, layer->color.b, 1.0f));
+            mat->setSpecular(osg::Material::FRONT_AND_BACK, osg::Vec4(0.1f, 0.1f, 0.1f, 1.0f));
+            mat->setShininess(osg::Material::FRONT_AND_BACK, 16.0f);
+            batchSS->setAttributeAndModes(mat.get(), osg::StateAttribute::ON);
+            batch.geometry->setStateSet(batchSS);
+        }
+        batch.geode->setNodeMask(0xFFFFFFFF);
+        objectRoot_->addChild(batch.geode.get());
+        batchGeodeToKey_[batch.geode.get()] = key;
+        layerBatches_[key] = std::move(batch);
+    }
+}
+
+void OsgScene::rebuildBatch(const std::string& batchKey) {
+    std::lock_guard<std::mutex> lock(batchMutex_);
+    auto it = layerBatches_.find(batchKey);
+    if (it == layerBatches_.end()) return;
+    LayerBatch& batch = it->second;
+    osg::ref_ptr<osg::Vec3Array> verts(new osg::Vec3Array());
+    osg::ref_ptr<osg::Vec3Array> norms(new osg::Vec3Array());
+    osg::ref_ptr<osg::DrawElementsUInt> tris(new osg::DrawElementsUInt(GL_TRIANGLES));
+    const domain::LayerRecord* layer = getLayer(batch.layerId);
+    verts->reserve(batch.objects.size() * 24);
+    norms->reserve(batch.objects.size() * 24);
+    tris->reserve(batch.objects.size() * 36);
+    batch.primitives.clear();
+    uint32_t tro = 0;
+    for (auto* op : batch.objects) {
+        if (hiddenObjects_.count(op->objectId)) continue;
+        uint32_t tb = tris->size();
+        uint32_t vertOffset = verts->size();
+        if (batch.type == domain::ObjectType::Via) {
+            float x = op->bboxMin[0]; float y = op->bboxMin[1];
+            float w = std::max(.01f, op->bboxMax[0] - op->bboxMin[0]); float h = std::max(.01f, op->bboxMax[1] - op->bboxMin[1]);
+            float d = std::max(.01f, op->bboxMax[2] - op->bboxMin[2]);
+            appendBoxToBatch(verts.get(), norms.get(), tris.get(), x, y, w, h, d, vertOffset, op->bboxMin[2]);
+        } else {
+            appendWireToBatch(verts.get(), norms.get(), tris.get(), *op, layer, vertOffset, op->bboxMin[2]);
+        }
+        uint32_t nt = (tris->size() - tb) / 3;
+        batch.primitives.push_back({op->objectId, tro, nt});
+        tro += nt;
+    }
+    if (verts->empty()) {
+        batch.geode->removeDrawables(0, batch.geode->getNumDrawables());
+        batch.geometry = nullptr; return;
+    }
+    osg::ref_ptr<osg::Geometry> newGeom = new osg::Geometry();
+    newGeom->setVertexArray(verts.get());
+    newGeom->setNormalArray(norms.get(), osg::Array::BIND_PER_VERTEX);
+    {
+        osg::Vec4Array* colors = new osg::Vec4Array();
+        colors->push_back(osg::Vec4(layer->color.r, layer->color.g, layer->color.b, 1.0f));
+        newGeom->setColorArray(colors, osg::Array::BIND_OVERALL);
+    }
+    newGeom->addPrimitiveSet(tris.get());
+    newGeom->setUseVertexBufferObjects(true);
+    {
+        osg::StateSet* batchSS = new osg::StateSet();
+        batchSS->setMode(GL_LIGHTING, osg::StateAttribute::ON);
+        batchSS->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
+        osg::ref_ptr<osg::Depth> depth = new osg::Depth(osg::Depth::LEQUAL, 0.0, 1.0, true);
+        batchSS->setAttributeAndModes(depth.get(), osg::StateAttribute::ON);
+        osg::ref_ptr<osg::Material> mat = new osg::Material();
+        mat->setAmbient(osg::Material::FRONT_AND_BACK, osg::Vec4(0.3f, 0.3f, 0.3f, 1.0f));
+        mat->setDiffuse(osg::Material::FRONT_AND_BACK, osg::Vec4(layer->color.r, layer->color.g, layer->color.b, 1.0f));
+        mat->setSpecular(osg::Material::FRONT_AND_BACK, osg::Vec4(0.1f, 0.1f, 0.1f, 1.0f));
+        mat->setShininess(osg::Material::FRONT_AND_BACK, 16.0f);
+        batchSS->setAttributeAndModes(mat.get(), osg::StateAttribute::ON);
+        newGeom->setStateSet(batchSS);
+    }
+    if (batch.geode->getNumDrawables() > 0) {
+        batch.geode->replaceDrawable(batch.geode->getDrawable(0), newGeom.get());
+        batch.geometry = newGeom;
+    } else {
+        batch.geode->addDrawable(newGeom.get());
+        batch.geometry = newGeom;
+    }
+}
+
+const std::string* OsgScene::findBatchObjectId(osg::Geode* geode, uint32_t triIdx) const {
+    std::lock_guard<std::mutex> lock(batchMutex_);
+    auto it = batchGeodeToKey_.find(geode);
+    if (it == batchGeodeToKey_.end()) return nullptr;
+    auto bi = layerBatches_.find(it->second);
+    if (bi == layerBatches_.end()) return nullptr;
+    return bi->second.findObjectIdByTri(triIdx);
+}
+
 
 size_t OsgScene::getObjectCount() const {
     return objects_.size();
@@ -563,12 +799,42 @@ std::vector<ISceneObject*> OsgScene::getObjectsByLayer(const std::string& layerI
 
 void OsgScene::setLayerVisible(const std::string& layerId, bool visible) {
     auto it = layers_.find(layerId);
-    if (it != layers_.end()) {
-        it->second.visible = visible;
-        for (const auto& pair : objectsById_) {
-            auto layerIt = objectLayerById_.find(pair.first);
-            if (layerIt != objectLayerById_.end() && layerIt->second == layerId) {
-                pair.second->setVisible(visible);
+    if (it == layers_.end()) return;
+    it->second.visible = visible;
+
+    // Collect all object IDs on this layer that need visibility updated
+    std::vector<std::string> objectsOnLayer;
+    for (const auto& pair : objectsById_) {
+        auto layerIt = objectLayerById_.find(pair.first);
+        if (layerIt != objectLayerById_.end() && layerIt->second == layerId) {
+            objectsOnLayer.push_back(pair.first);
+        }
+    }
+
+    // For non-batched objects (instances), use setObjectVisible to properly update hiddenObjects_
+    for (const auto& objectId : objectsOnLayer) {
+        auto batchIt = objectIdToBatchKey_.find(objectId);
+        if (batchIt == objectIdToBatchKey_.end()) {
+            // Not batched - use setObjectVisible to handle hiddenObjects_ properly
+            if (visible) {
+                hiddenObjects_.erase(objectId);
+            } else {
+                hiddenObjects_.insert(objectId);
+            }
+            auto objIt = objectsById_.find(objectId);
+            if (objIt != objectsById_.end() && objIt->second) {
+                objIt->second->setVisible(visible);
+            }
+        }
+    }
+
+    // Handle batched objects (wires/vias)
+    std::string prefix = layerId + "_";
+    for (auto& [key, batch] : layerBatches_) {
+        if (key.compare(0, prefix.size(), prefix) == 0 && batch.geode) {
+            batch.geode->setNodeMask(visible ? 0xFFFFFFFF : 0);
+            if (visible) {
+                rebuildBatch(key);
             }
         }
     }
@@ -604,47 +870,61 @@ const domain::LayerRecord* OsgScene::getLayer(const std::string& layerId) const 
 }
 
 ISceneObject* OsgScene::raycast(const Vec3& origin, const Vec3& direction, float maxDistance) {
-    if (!objectRoot_ || objectsById_.empty()) {
-        return nullptr;
-    }
-
-    osg::Vec3d rayOrigin(origin.x, origin.y, origin.z);
-    osg::Vec3d rayDirection(direction.x, direction.y, direction.z);
-    if (rayDirection.length2() <= 1e-12) {
-        return nullptr;
-    }
-    rayDirection.normalize();
-
-    const double distance = maxDistance > 0.0F ? static_cast<double>(maxDistance) : 1e6;
-    osg::Vec3d rayEnd = rayOrigin + rayDirection * distance;
-
-    osg::ref_ptr<osgUtil::LineSegmentIntersector> intersector =
-        new osgUtil::LineSegmentIntersector(rayOrigin, rayEnd);
-    osgUtil::IntersectionVisitor visitor(intersector.get());
+    if (!objectRoot_) return nullptr;
+    osg::Vec3d ro(origin.x, origin.y, origin.z);
+    osg::Vec3d rd(direction.x, direction.y, direction.z);
+    if (rd.length2() <= 1e-12) return nullptr;
+    rd.normalize();
+    double dist = maxDistance > 0.0F ? static_cast<double>(maxDistance) : 1e6;
+    osg::Vec3d re = ro + rd * dist;
+    osg::ref_ptr<osgUtil::LineSegmentIntersector> isect(new osgUtil::LineSegmentIntersector(ro, re));
+    osgUtil::IntersectionVisitor visitor(isect.get());
     objectRoot_->accept(visitor);
+    if (!isect->containsIntersections()) return nullptr;
 
-    if (!intersector->containsIntersections()) {
-        return nullptr;
-    }
-
-    for (const auto& intersection : intersector->getIntersections()) {
-        for (auto nodeIt = intersection.nodePath.rbegin(); nodeIt != intersection.nodePath.rend(); ++nodeIt) {
-            osg::Node* candidateNode = *nodeIt;
-            if (!candidateNode) {
-                continue;
-            }
-            for (const auto& objectPair : objectsById_) {
-                OsgSceneObject* candidateObject = objectPair.second;
-                if (!candidateObject || !candidateObject->isSelectable() || !candidateObject->isVisible()) {
-                    continue;
-                }
-                if (candidateObject->getOsgNode() == candidateNode) {
-                    return candidateObject;
+    // Distance-priority selection: closest object is selected
+    std::vector<std::pair<ISceneObject*, float>> hits;  // (object, distance)
+    for (const auto& intersection : isect->getIntersections()) {
+        float hd = static_cast<float>(intersection.ratio * dist);
+        // Batch geometry hit check
+        osg::Geode* geode = intersection.nodePath.empty() ? nullptr
+            : dynamic_cast<osg::Geode*>(intersection.nodePath.back());
+        if (geode) {
+            const std::string* bid = findBatchObjectId(geode, static_cast<uint32_t>(intersection.primitiveIndex));
+            if (bid) {
+                // Skip if this is the currently selected object (it's shown as highlight)
+                if (*bid == selectedObjectId_) continue;
+                auto oit = objectsById_.find(*bid);
+                if (oit != objectsById_.end() && oit->second) {
+                    auto layerIt = objectLayerById_.find(*bid);
+                    bool layerVisible = layerIt == objectLayerById_.end() || isLayerVisible(layerIt->second);
+                    if (layerVisible && hiddenObjects_.find(*bid) == hiddenObjects_.end()) {
+                        hits.emplace_back(oit->second, hd);
+                    }
                 }
             }
         }
+        // Individual node path scan
+        for (auto ni = intersection.nodePath.rbegin(); ni != intersection.nodePath.rend(); ++ni) {
+            osg::Node* cn = *ni; if (!cn) continue;
+            for (auto& [id, sobj] : objectsById_) {
+                if (!sobj || !sobj->isSelectable() || !sobj->isVisible()) continue;
+                if (sobj->getOsgNode() != cn) continue;
+                if (hiddenObjects_.find(id) != hiddenObjects_.end()) continue;
+                if (id == selectedObjectId_) continue;  // Skip selected object
+                auto layerIt = objectLayerById_.find(id);
+                if (layerIt != objectLayerById_.end() && !isLayerVisible(layerIt->second)) continue;
+                hits.emplace_back(sobj, hd);
+            }
+        }
     }
-
+    if (!hits.empty()) {
+        // Sort by distance only - closest object is returned
+        std::sort(hits.begin(), hits.end(), [](auto& a, auto& b) {
+            return a.second < b.second;
+        });
+        return hits[0].first;
+    }
     return nullptr;
 }
 
@@ -686,50 +966,215 @@ void OsgScene::loadSnapshot(const domain::SceneSnapshot& snapshot) {
         layers_[layer.layerId] = layer;
     }
 
-    // Debug mode: controlled by OPENROAD_3D_DEBUG env var
-    static const bool debugMode = []() {
-        const char* env = std::getenv("OPENROAD_3D_DEBUG");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
+    // Store pointer to backend's snapshot objects (no copy)
+    pendingObjects_ = &snapshot.objects;
+    loadedObjectIds_.clear();
+    objectIndexById_.clear();
+    objectIndexById_.reserve(pendingObjects_->size());
+    for (size_t i = 0; i < pendingObjects_->size(); ++i) {
+        objectIndexById_[(*pendingObjects_)[i].objectId] = &(*pendingObjects_)[i];
+    }
 
-    // In debug mode: skip pins/insts, show 1 wire per metal layer, 1 via per cut layer.
-    std::unordered_map<std::string, int> wireCount;
-    std::unordered_map<std::string, int> cutCount;
-
-    for (const auto& obj : snapshot.objects) {
-        if (debugMode) {
-            if (obj.type == domain::ObjectType::Pin) continue;
-            if (obj.type == domain::ObjectType::Inst) continue;
-            // Determine layer category from layerId
-            bool isMetal = obj.layerId.find("metal") != std::string::npos;
-            bool isCut = obj.layerId.find("cut") != std::string::npos
-                      || obj.layerId.find("via") != std::string::npos;
-            if (!isMetal && !isCut) continue;
-            if (obj.type == domain::ObjectType::Wire) {
-                if (!isMetal) continue;
-                auto& cnt = wireCount[obj.layerId];
-                if (cnt++ >= 1) continue;
-            }
-            if (obj.type == domain::ObjectType::Via) {
-                if (!isCut) continue;
-                auto& cnt = cutCount[obj.layerId];
-                if (cnt++ >= 1) continue;
+    // Build spatial index for frustum culling
+    if (frustumCullingEnabled_ && !snapshot.objects.empty()) {
+        std::vector<std::pair<std::string, AABB>> objectBoxes;
+        objectBoxes.reserve(snapshot.objects.size());
+        for (const auto& obj : snapshot.objects) {
+            if (obj.hasBbox) {
+                AABB box({obj.bboxMin[0], obj.bboxMin[1], obj.bboxMin[2]},
+                         {obj.bboxMax[0], obj.bboxMax[1], obj.bboxMax[2]});
+                objectBoxes.emplace_back(obj.objectId, box);
             }
         }
-
-        const domain::LayerRecord* layer = getLayer(obj.layerId);
-        OsgSceneObject* sceneObj = createSceneObject(obj, layer);
-        if (sceneObj) {
-            addObject(sceneObj);
+        if (!objectBoxes.empty()) {
+            spatialIndex_.build(objectBoxes, 6);
+            fprintf(stderr, "DEBUG: Built spatial index with %zu nodes for %zu objects\n",
+                    spatialIndex_.getNodeCount(), objectBoxes.size());
         }
     }
+
+    // Create objects in initial view frustum only (lazy load)
+    if (lazyLoadEnabled_) {
+        ensureObjectsInFrustum();
+    } else {
+        // Load all objects immediately
+        for (const auto& obj : *pendingObjects_) {
+            // Skip batched types (Wire, Via) - geometry in layerBatches_
+            if (obj.type == domain::ObjectType::Wire || obj.type == domain::ObjectType::Via) {
+                loadedObjectIds_.insert(obj.objectId);
+                continue;
+            }
+            const domain::LayerRecord* layer = getLayer(obj.layerId);
+            OsgSceneObject* sceneObj = createSceneObject(obj, layer);
+            if (sceneObj) {
+                addObject(sceneObj);
+                loadedObjectIds_.insert(obj.objectId);
+            }
+        }
+    }
+
+    size_t totalPending = pendingObjects_->size();
+
+    if (isDebugLoggingEnabled()) {
+        fprintf(stderr, "DEBUG: loadScene: loaded %zu / %zu objects, %zu layers\n",
+                loadedObjectIds_.size(), totalPending, snapshot.layers.size());
+    }
+
+    // Build geometry batches for Wire and Via objects
+    buildBatches(snapshot);
+
+    // Note: pendingObjects_ points to backend snapshot data
+    // objectIndexById_ provides O(1) lookup by storing pointers to ObjectRecord
 
     // Add XYZ coordinate axes at scene bounding box center
     createCoordinateAxes();
 }
 
+void OsgScene::ensureObjectsInFrustum() {
+    if (!frustumCullingEnabled_ || !pendingObjects_ || pendingObjects_->empty()) {
+        return;
+    }
+
+    // Get visible object IDs from spatial index
+    std::vector<std::string> visibleIds;
+    spatialIndex_.getObjectsInFrustum(currentFrustum_, visibleIds);
+    const size_t nVisible = visibleIds.size();
+    const size_t nLoaded = loadedObjectIds_.size();
+    const size_t nTotal = pendingObjects_->size();
+
+    // Fast path: frustum covers all or nearly all objects.
+    // Skip distance sorting since nothing needs prioritized loading,
+    // and skip visibleSet construction since nothing can be outside.
+    bool allVisible = (nVisible >= nTotal * 0.98f);
+
+    if (allVisible) {
+        // Only load newly arrived individual objects (batched types always loaded).
+        if (nLoaded < nTotal) {
+            for (const auto& objectId : visibleIds) {
+                if (loadedObjectIds_.find(objectId) != loadedObjectIds_.end()) {
+                    continue;
+                }
+                auto objIt = objectIndexById_.find(objectId);
+                if (objIt == objectIndexById_.end()) continue;
+                const domain::ObjectRecord& obj = *objIt->second;
+                // Skip batched types (Wire, Via) - geometry in layerBatches_
+                if (obj.type == domain::ObjectType::Wire || obj.type == domain::ObjectType::Via) {
+                    loadedObjectIds_.insert(objectId);
+                    continue;
+                }
+                // Check if object is hidden or layer is not visible
+                if (hiddenObjects_.find(obj.objectId) != hiddenObjects_.end()) {
+                    loadedObjectIds_.insert(obj.objectId);
+                    continue;
+                }
+                auto layerIt = objectLayerById_.find(obj.objectId);
+                if (layerIt != objectLayerById_.end() && !isLayerVisible(layerIt->second)) {
+                    loadedObjectIds_.insert(obj.objectId);
+                    continue;
+                }
+                const domain::LayerRecord* layer = getLayer(obj.layerId);
+                OsgSceneObject* sceneObj = createSceneObject(obj, layer);
+                if (sceneObj) {
+                    addObject(sceneObj);
+                    loadedObjectIds_.insert(obj.objectId);
+                }
+            }
+        }
+        return;
+    }
+
+    // Narrow frustum: sort by distance so nearest objects load first.
+    std::vector<std::pair<std::string, float>> objectDistances;
+    objectDistances.reserve(nVisible);
+    for (const auto& objectId : visibleIds) {
+        auto it = objectIndexById_.find(objectId);
+        if (it != objectIndexById_.end()) {
+            const auto& obj = *it->second;
+            float dist = obj.hasBbox ? std::sqrt(obj.bboxMin[0]*obj.bboxMin[0] + obj.bboxMin[1]*obj.bboxMin[1] + obj.bboxMin[2]*obj.bboxMin[2]) : 0.0f;
+            objectDistances.emplace_back(objectId, dist);
+        }
+    }
+    std::sort(objectDistances.begin(), objectDistances.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    // Apply per-frame load cap, then rebuild visibleIds in distance order
+    visibleIds.clear();
+    size_t pendingNew = 0;
+    for (const auto& p : objectDistances) {
+        if (loadedObjectIds_.find(p.first) == loadedObjectIds_.end()) {
+            if (pendingNew >= kMaxObjectsPerFrame) break;
+            pendingNew++;
+        }
+        visibleIds.push_back(p.first);
+    }
+
+    // visibleSet for unload detection (only built on narrow frustum updates)
+    std::unordered_set<std::string> visibleSet;
+    visibleSet.reserve(visibleIds.size());
+    for (const auto& id : visibleIds) {
+        visibleSet.insert(id);
+    }
+
+    // Unload objects that left the frustum
+    std::vector<std::string> toUnload;
+    toUnload.reserve(nLoaded);
+    for (const auto& objectId : loadedObjectIds_) {
+        if (visibleSet.find(objectId) == visibleSet.end()) {
+            toUnload.push_back(objectId);
+        }
+    }
+    for (const auto& objectId : toUnload) {
+        auto it = objectsById_.find(objectId);
+        if (it == objectsById_.end() || !it->second) continue;
+        OsgSceneObject* obj = it->second;
+        osg::Node* node = obj->getOsgNode();
+        if (node) {
+            objectRoot_->removeChild(node);
+            objects_.erase(std::remove(objects_.begin(), objects_.end(), node), objects_.end());
+        }
+        textLabelNodes_.erase(objectId);
+        stippleNodes_.erase(objectId);
+        objectRecordPtrs_.erase(objectId);
+        delete obj;
+        objectsById_.erase(it);
+        objectLayerById_.erase(objectId);
+        loadedObjectIds_.erase(objectId);
+    }
+
+    // Load newly visible objects within cap (skip batched Wire/Via)
+    for (const auto& objectId : visibleIds) {
+        if (loadedObjectIds_.find(objectId) != loadedObjectIds_.end()) continue;
+        auto objIt = objectIndexById_.find(objectId);
+        if (objIt == objectIndexById_.end()) continue;
+        const domain::ObjectRecord& obj = *objIt->second;
+        // Wire/Via are in layerBatches_, not individual scene objects
+        if (obj.type == domain::ObjectType::Wire || obj.type == domain::ObjectType::Via) {
+            loadedObjectIds_.insert(objectId);
+            continue;
+        }
+        // Check if object is hidden or layer is not visible
+        if (hiddenObjects_.find(objectId) != hiddenObjects_.end()) {
+            loadedObjectIds_.insert(objectId);
+            continue;
+        }
+        auto layerIt = objectLayerById_.find(objectId);
+        if (layerIt != objectLayerById_.end() && !isLayerVisible(layerIt->second)) {
+            loadedObjectIds_.insert(objectId);
+            continue;
+        }
+        const domain::LayerRecord* layer = getLayer(obj.layerId);
+        OsgSceneObject* sceneObj = createSceneObject(obj, layer);
+        if (sceneObj) {
+            addObject(sceneObj);
+            loadedObjectIds_.insert(objectId);
+        }
+    }
+}
 void OsgScene::upsertObjects(const std::vector<domain::ObjectRecord>& objects) {
+    std::unordered_set<std::string> affectedBatches;
     for (const auto& obj : objects) {
+        bool isBatchedType = (obj.type == domain::ObjectType::Wire || obj.type == domain::ObjectType::Via);
+
         auto existing = objectsById_.find(obj.objectId);
         if (existing != objectsById_.end()) {
             OsgSceneObject* existingObj = existing->second;
@@ -743,11 +1188,39 @@ void OsgScene::upsertObjects(const std::vector<domain::ObjectRecord>& objects) {
             objectLayerById_.erase(obj.objectId);
         }
 
+        if (isBatchedType) {
+            auto batchIt = objectIdToBatchKey_.find(obj.objectId);
+            if (batchIt != objectIdToBatchKey_.end()) {
+                affectedBatches.insert(batchIt->second);
+                // Bug 1 fix: also update the pointer in batch.objects
+                auto bi = layerBatches_.find(batchIt->second);
+                if (bi != layerBatches_.end()) {
+                    for (auto& op : bi->second.objects) {
+                        if (op && op->objectId == obj.objectId) {
+                            op = &obj;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Bug 2 fix: for batched types, do NOT create scene object with OSG node.
+            // Geometry is in the batch, not in individual scene objects.
+            // Just update indices and continue.
+            auto idxIt = objectIndexById_.find(obj.objectId);
+            if (idxIt != objectIndexById_.end()) {
+                idxIt->second = &obj;
+            }
+            continue;
+        }
+
         const domain::LayerRecord* layer = getLayer(obj.layerId);
         OsgSceneObject* sceneObj = createSceneObject(obj, layer);
         if (sceneObj) {
             addObject(sceneObj);
         }
+    }
+    for (const auto& key : affectedBatches) {
+        rebuildBatch(key);
     }
 }
 
@@ -756,16 +1229,32 @@ void OsgScene::updateObjectVisibility(
     for (const auto& entry : visibilityUpdates) {
         const std::string& objectId = entry.first;
         const bool visible = entry.second;
-        auto found = objectsById_.find(objectId);
-        if (found != objectsById_.end() && found->second) {
-            found->second->setVisible(visible);
-        }
+        setObjectVisible(objectId, visible);
     }
 }
 
 void OsgScene::removeObjectsById(const std::vector<std::string>& objectIds) {
     if (objectIds.empty()) {
         return;
+    }
+
+    std::unordered_set<std::string> affectedBatches;
+    {
+        std::lock_guard<std::mutex> lock(batchMutex_);
+        for (const auto& id : objectIds) {
+            objectIdToBatchKey_.erase(id);
+            for (auto& [key, batch] : layerBatches_) {
+                auto it = std::remove_if(batch.objects.begin(), batch.objects.end(),
+                    [&](const domain::ObjectRecord* p) { return p && p->objectId == id; });
+                if (it != batch.objects.end()) {
+                    batch.objects.erase(it, batch.objects.end());
+                    affectedBatches.insert(key);
+                }
+            }
+        }
+    }
+    for (const auto& key : affectedBatches) {
+        rebuildBatch(key);
     }
 
     std::unordered_set<std::string> idSet;
@@ -854,7 +1343,7 @@ void OsgScene::restoreObjectMaterial(osg::Node* node) {
 }
 
 void OsgScene::setSelectedObject(const std::string& objectId) {
-    // English comment.
+    // Clear existing highlights
     for (auto& pair : highlightNodes_) {
         osg::Group* parent = pair.second->getParent(0);
         if (parent) {
@@ -863,39 +1352,96 @@ void OsgScene::setSelectedObject(const std::string& objectId) {
         highlightRoot_->removeChild(pair.second);
     }
     highlightNodes_.clear();
-    
-    // English comment.
+
+    // Restore previous selection if exists
     if (!previousSelectedId_.empty()) {
-        auto prevIt = objectsById_.find(previousSelectedId_);
-        if (prevIt != objectsById_.end()) {
-            restoreObjectMaterial(prevIt->second->getOsgNode());
+        auto prevBatchIt = objectIdToBatchKey_.find(previousSelectedId_);
+        if (prevBatchIt != objectIdToBatchKey_.end()) {
+            // Previous was a batched object - restore it to batch
+            hiddenObjects_.erase(previousSelectedId_);
+            rebuildBatch(prevBatchIt->second);
+        } else {
+            auto prevIt = objectsById_.find(previousSelectedId_);
+            if (prevIt != objectsById_.end()) {
+                osg::Node* prevNode = prevIt->second->getOsgNode();
+                if (prevNode) {
+                    restoreObjectMaterial(prevNode);
+                }
+            }
         }
-    }
-    
-    if (objectId.empty()) {
         previousSelectedId_.clear();
+    }
+
+    if (objectId.empty()) {
+        selectedObjectId_.clear();
         return;
     }
-    
-    // English comment.
+
+    // Handle new selection
+    auto batchIt = objectIdToBatchKey_.find(objectId);
+    if (batchIt != objectIdToBatchKey_.end()) {
+        // Batched object (Wire/Via)
+        std::string batchKey = batchIt->second;
+        hiddenObjects_.insert(objectId);
+        rebuildBatch(batchKey);
+
+        // Find the ObjectRecord for highlight geometry
+        const domain::ObjectRecord* objRec = nullptr;
+        auto objIt = objectIndexById_.find(objectId);
+        if (objIt != objectIndexById_.end()) {
+            objRec = objIt->second;
+        }
+        if (objRec && objRec->hasBbox) {
+            osg::ref_ptr<osg::Vec3Array> verts(new osg::Vec3Array());
+            osg::ref_ptr<osg::Vec3Array> norms(new osg::Vec3Array());
+            osg::ref_ptr<osg::DrawElementsUInt> tris(new osg::DrawElementsUInt(GL_TRIANGLES));
+
+            float x = objRec->bboxMin[0];
+            float y = objRec->bboxMin[1];
+            float w = std::max(.01f, objRec->bboxMax[0] - objRec->bboxMin[0]);
+            float h = std::max(.01f, objRec->bboxMax[1] - objRec->bboxMin[1]);
+            float d = std::max(.01f, objRec->bboxMax[2] - objRec->bboxMin[2]);
+            appendBoxToBatch(verts.get(), norms.get(), tris.get(), x, y, w, h, d, 0, objRec->bboxMin[2]);
+
+            osg::Geometry* highlightGeom = new osg::Geometry();
+            highlightGeom->setVertexArray(verts.get());
+            highlightGeom->setNormalArray(norms.get(), osg::Array::BIND_PER_VERTEX);
+            osg::Vec4Array* colors = new osg::Vec4Array();
+            colors->push_back(osg::Vec4(1.0f, 0.9f, 0.3f, 1.0f));
+            highlightGeom->setColorArray(colors, osg::Array::BIND_OVERALL);
+            highlightGeom->addPrimitiveSet(tris.get());
+            highlightGeom->setUseVertexBufferObjects(true);
+
+            osg::Geode* geode = new osg::Geode();
+            geode->addDrawable(highlightGeom);
+            geode->setName("highlight_" + objectId);
+            osg::StateSet* ss = geode->getOrCreateStateSet();
+            ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
+            ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
+            highlightRoot_->addChild(geode);
+            highlightNodes_[objectId] = geode;
+        }
+        previousSelectedId_ = objectId;
+        selectedObjectId_ = objectId;
+        return;
+    }
+
+    // Non-batched object with OSG node
     auto it = objectsById_.find(objectId);
     if (it != objectsById_.end()) {
         osg::Node* node = it->second->getOsgNode();
         if (node) {
-            // English comment.
             applyGlowMaterial(node);
-            
-            // English comment.
+
             osg::Geometry* highlightGeom = createSelectionGeometry(node);
             osg::Geode* geode = new osg::Geode();
             geode->addDrawable(highlightGeom);
-            
-            // English comment.
-            // English comment.
+
             highlightRoot_->addChild(geode);
             highlightNodes_[objectId] = geode;
-            
+
             previousSelectedId_ = objectId;
+            selectedObjectId_ = objectId;
         }
     }
 }
@@ -1014,10 +1560,12 @@ void OsgScene::setDisplayNamesVisible(bool visible) {
     displayNamesVisible_ = visible;
 
     if (visible) {
-        // Rebuild labels for all existing objects
+        // Rebuild labels for non-batched (Inst, Pin, DRC, Track, Blockage) objects only.
+        // Batched types (Wire, Via) don't have individual MatrixTransform nodes.
         for (const auto& pair : objectRecordPtrs_) {
             const std::string& objectId = pair.first;
             const domain::ObjectRecord* obj = pair.second;
+            if (obj->type == domain::ObjectType::Wire || obj->type == domain::ObjectType::Via) continue;
             auto objIt = objectsById_.find(objectId);
             if (objIt == objectsById_.end()) {
                 continue;
@@ -1076,26 +1624,33 @@ void OsgScene::setStippleVisible(bool visible) {
 }
 
 void OsgScene::setObjectVisible(const std::string& objectId, bool visible) {
+    // Check if it is a batched object (Wire/Via) -> use O(1) reverse index
+    auto batchIt = objectIdToBatchKey_.find(objectId);
+    if (batchIt != objectIdToBatchKey_.end()) {
+        std::string batchKeyToRebuild = batchIt->second;
+        if (visible) hiddenObjects_.erase(objectId);
+        else hiddenObjects_.insert(objectId);
+        // Clean up individual scene object if one was created
+        auto it = objectsById_.find(objectId);
+        if (it != objectsById_.end()) {
+            if (it->second) { osg::Node* n = it->second->getOsgNode(); if (n) objectRoot_->removeChild(n); }
+            delete it->second; objectsById_.erase(it); objectLayerById_.erase(objectId); loadedObjectIds_.erase(objectId);
+        }
+        rebuildBatch(batchKeyToRebuild);
+        return;
+    }
+
+    // Non-batched object: existing logic
     auto it = objectsById_.find(objectId);
     if (it == objectsById_.end()) return;
     OsgSceneObject* obj = objectsById_[objectId];
     if (!obj) return;
-
-    // Check layer visibility - object can only be visible if its layer is visible
     auto layerIt = objectLayerById_.find(objectId);
-    bool layerIsVisible = true;
-    if (layerIt != objectLayerById_.end()) {
-        layerIsVisible = isLayerVisible(layerIt->second);
-    }
-
-    // Object is visible only if BOTH visible=true AND layer is visible
+    bool layerIsVisible = layerIt != objectLayerById_.end() ? isLayerVisible(layerIt->second) : true;
     bool actuallyVisible = visible && layerIsVisible;
     obj->setVisible(actuallyVisible);
-    if (actuallyVisible) {
-        hiddenObjects_.erase(objectId);
-    } else {
-        hiddenObjects_.insert(objectId);
-    }
+    if (actuallyVisible) hiddenObjects_.erase(objectId);
+    else hiddenObjects_.insert(objectId);
 }
 
 bool OsgScene::isObjectVisible(const std::string& objectId) const {
@@ -1113,6 +1668,93 @@ std::string OsgScene::findObjectIdAtScreen(float nx, float ny) const {
         }
     }
     return "";
+}
+
+void OsgScene::updateFrustum(const double* viewMatrix, const double* projectionMatrix) {
+    if (!frustumCullingEnabled_) {
+        return;
+    }
+
+    // Debug: print view matrix
+    if (isDebugLoggingEnabled()) {
+        fprintf(stderr, "DEBUG View matrix:\n");
+        for (int i = 0; i < 4; i++) {
+            fprintf(stderr, "  [% .4f % .4f % .4f % .4f]\n",
+                    viewMatrix[i*4], viewMatrix[i*4+1], viewMatrix[i*4+2], viewMatrix[i*4+3]);
+        }
+        fprintf(stderr, "DEBUG Projection matrix:\n");
+        for (int i = 0; i < 4; i++) {
+            fprintf(stderr, "  [% .4f % .4f % .4f % .4f]\n",
+                    projectionMatrix[i*4], projectionMatrix[i*4+1], projectionMatrix[i*4+2], projectionMatrix[i*4+3]);
+        }
+    }
+
+    // Compute VP = Projection * View (column-major)
+    // For column-major: element(row, col) is at index col*4 + row
+    // VP(col, row) = sum_k P(k, row) * V(col, k)
+    // In 1D: vp[col*4+row] = sum_k P[k*4+row] * V[col*4+k]
+    double vp[16] = {0};
+    for (int col = 0; col < 4; col++) {
+        for (int row = 0; row < 4; row++) {
+            for (int k = 0; k < 4; k++) {
+                vp[col * 4 + row] += projectionMatrix[k * 4 + row] * viewMatrix[col * 4 + k];
+            }
+        }
+    }
+
+    // Debug: print VP matrix
+    if (isDebugLoggingEnabled()) {
+        fprintf(stderr, "DEBUG VP matrix (P*V):\n");
+        for (int i = 0; i < 4; i++) {
+            fprintf(stderr, "  [% .4f % .4f % .4f % .4f]\n",
+                    vp[i*4], vp[i*4+1], vp[i*4+2], vp[i*4+3]);
+        }
+    }
+
+    // Convert to float for setFromMatrix
+    float vpFloat[16];
+    for (int i = 0; i < 16; i++) {
+        vpFloat[i] = static_cast<float>(vp[i]);
+    }
+    currentFrustum_.setFromMatrix(vpFloat);
+
+    // Debug: test frustum against FULL scene bounding box
+    if (isDebugLoggingEnabled() && pendingObjects_ && !pendingObjects_->empty()) {
+        // Compute full scene bbox from all objects
+        AABB fullSceneBox;
+        for (const auto& obj : *pendingObjects_) {
+            if (obj.hasBbox) {
+                fullSceneBox.expand({obj.bboxMin[0], obj.bboxMin[1], obj.bboxMin[2]});
+                fullSceneBox.expand({obj.bboxMax[0], obj.bboxMax[1], obj.bboxMax[2]});
+            }
+        }
+        fprintf(stderr, "DEBUG fullSceneBox: min=(%.2f,%.2f,%.2f) max=(%.2f,%.2f,%.2f) center=(%.2f,%.2f,%.2f)\n",
+                fullSceneBox.min[0], fullSceneBox.min[1], fullSceneBox.min[2],
+                fullSceneBox.max[0], fullSceneBox.max[1], fullSceneBox.max[2],
+                fullSceneBox.center()[0], fullSceneBox.center()[1], fullSceneBox.center()[2]);
+        FrustumTest test = currentFrustum_.testBox(fullSceneBox);
+        fprintf(stderr, "DEBUG frustum vs fullSceneBox: %s\n",
+                test == FrustumTest::Inside ? "Inside" :
+                test == FrustumTest::Intersect ? "Intersect" : "Outside");
+        currentFrustum_.print();
+    }
+}
+
+void OsgScene::getVisibleObjects(std::vector<std::string>& visibleIds) {
+    visibleIds.clear();
+
+    if (!frustumCullingEnabled_) {
+        // If culling disabled, return all visible objects
+        visibleIds.reserve(objectsById_.size());
+        for (const auto& pair : objectsById_) {
+            if (hiddenObjects_.find(pair.first) == hiddenObjects_.end()) {
+                visibleIds.push_back(pair.first);
+            }
+        }
+        return;
+    }
+
+    spatialIndex_.getObjectsInFrustum(currentFrustum_, visibleIds);
 }
 
 void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
@@ -1134,9 +1776,9 @@ void OsgScene::attachObjectLabels(osg::MatrixTransform* transform,
         xlen = std::max(0.01F, obj.bboxMax[0] - obj.bboxMin[0]);
         ylen = std::max(0.01F, obj.bboxMax[1] - obj.bboxMin[1]);
         zlen = std::max(0.01F, obj.bboxMax[2] - obj.bboxMin[2]);
-        
-        // DEBUG: Print bbox for net210
-        if (obj.displayName == "net210") {
+
+        // DEBUG: Print bbox for net210 (only when debug logging enabled)
+        if (isDebugLoggingEnabled() && obj.displayName == "net210") {
             fprintf(stderr, "DEBUG bbox: text=%s bboxMin=(%.4f,%.4f,%.4f) bboxMax=(%.4f,%.4f,%.4f) transform[14]=%.4f\n",
                     obj.displayName.c_str(),
                     obj.bboxMin[0], obj.bboxMin[1], obj.bboxMin[2],
@@ -1459,39 +2101,6 @@ osg::Quat OsgScene::computeFaceRotation(LabelFace face,
     return rotation;
 }
 
-// DEBUG: colored marker box at text face position for visual verification
-osg::Node* OsgScene::makeMarkerBox(float cx, float cy, float cz,
-                                    const osg::Vec4& color,
-                                    const osg::Quat& rotation) {
-    float s = 0.1f;  // world-space marker size (visible but not blocking text)
-    osg::Box* box = new osg::Box(osg::Vec3(0, 0, 0), s, s, s);  // center at origin
-    osg::ShapeDrawable* drawable = new osg::ShapeDrawable(box);
-    drawable->setColor(color);
-    osg::Geode* geode = new osg::Geode();
-    geode->addDrawable(drawable);
-    
-    // Use TRANSPARENT_BIN like text, with depth write disabled
-    osg::StateSet* ss = geode->getOrCreateStateSet();
-    ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
-    ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON);
-    ss->setMode(GL_BLEND, osg::StateAttribute::ON);
-    ss->setRenderingHint(osg::StateSet::TRANSPARENT_BIN);
-    osg::Depth* depth = new osg::Depth();
-    depth->setWriteMask(false);  // don't write to depth buffer
-    ss->setAttributeAndModes(depth, osg::StateAttribute::ON);
-
-    osg::MatrixTransform* mt = new osg::MatrixTransform();
-    // OSG row-major (v * M): leftmost = applied first to vertex.
-    // We want: scale FIRST, rotate SECOND, translate LAST.
-    // So build as: S * R * T (S leftmost = applied first)
-    osg::Matrixd markerMat = osg::Matrixd::scale(s, s, s)
-                          * osg::Matrixd::rotate(rotation)
-                          * osg::Matrixd::translate(cx, cy, cz);
-    mt->setMatrix(markerMat);
-    mt->addChild(geode);
-    return mt;
-}
-
 osg::Node* OsgScene::makeStippleFaceQuad(float cx, float cy, float cz,
                                           float halfW, float halfH,
                                           int dim1, int dim2,
@@ -1765,14 +2374,18 @@ void OsgScene::attachObjectGeometry(osg::Geode* geode,
     }
 }
 
-void OsgScene::configureGeodeRenderState(osg::Geode* geode,
-                                         const domain::LayerRecord& layer,
-                                         domain::ObjectType objectType) {
-    if (!geode) {
-        return;
+osg::StateSet* OsgScene::getOrCreateLayerStateSet(const domain::LayerRecord& layer,
+                                                    domain::ObjectType objectType) {
+    // Create cache key from layerId and objectType
+    std::string key = layer.layerId + "_" + std::to_string(static_cast<int>(objectType));
+
+    auto it = layerStateSetCache_.find(key);
+    if (it != layerStateSetCache_.end()) {
+        return it->second.get();
     }
 
-    osg::StateSet* stateset = geode->getOrCreateStateSet();
+    // Create new StateSet
+    osg::ref_ptr<osg::StateSet> stateset = new osg::StateSet();
     stateset->setMode(GL_LIGHTING, osg::StateAttribute::ON);
 
     osg::Material* material = new osg::Material();
@@ -1784,8 +2397,8 @@ void OsgScene::configureGeodeRenderState(osg::Geode* geode,
     const float legoG = std::clamp(baseG * 1.08F, 0.0F, 1.0F);
     const float legoB = std::clamp(baseB * 1.08F, 0.0F, 1.0F);
     const float effectiveTransparency = (objectType == domain::ObjectType::Inst)
-                                            ? std::max(layer.transparency, 0.55F)
-                                            : layer.transparency;
+                                           ? std::max(layer.transparency, 0.55F)
+                                           : layer.transparency;
     material->setAmbient(osg::Material::FRONT_AND_BACK,
                          osg::Vec4(legoR * 0.22F,
                                    legoG * 0.22F,
@@ -1811,7 +2424,7 @@ void OsgScene::configureGeodeRenderState(osg::Geode* geode,
         = new osg::PolygonMode(osg::PolygonMode::FRONT_AND_BACK, osg::PolygonMode::FILL);
     stateset->setAttributeAndModes(pm, osg::StateAttribute::ON);
 
-    applyStipple(stateset, layer.lineStyle, layer.stippleId);
+    applyStipple(stateset.get(), layer.lineStyle, layer.stippleId);
 
     if (effectiveTransparency > 0.0F) {
         stateset->setMode(GL_BLEND, osg::StateAttribute::ON);
@@ -1828,6 +2441,19 @@ void OsgScene::configureGeodeRenderState(osg::Geode* geode,
     depth->setWriteMask(true);
     depth->setFunction(osg::Depth::LESS);
     stateset->setAttributeAndModes(depth, osg::StateAttribute::ON);
+
+    layerStateSetCache_[key] = stateset;
+    return stateset.get();
+}
+
+void OsgScene::configureGeodeRenderState(osg::Geode* geode,
+                                         const domain::LayerRecord& layer,
+                                         domain::ObjectType objectType) {
+    if (!geode) {
+        return;
+    }
+    // Use cached StateSet instead of creating new one per object
+    geode->setStateSet(getOrCreateLayerStateSet(layer, objectType));
 }
 
 // English comment.

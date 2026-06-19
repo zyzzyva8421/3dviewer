@@ -21,45 +21,50 @@ class OdbSceneBuilder {
   explicit OdbSceneBuilder(odb::dbDatabase* db);
   ~OdbSceneBuilder();
 
-  // Build SceneSnapshot from the current database design
+  // Build a complete SceneSnapshot from the current ODB design state.
+  // Output units are microns for geometry coordinates.
   viewer3d::domain::SceneSnapshot build();
 
-  // Get database units per micron for coordinate conversion
+  // Return DB units per micron used for dbu-to-micron conversion.
   int getDbUnitsPerMicron() const;
 
  private:
-  // Process all instances
+  // Append placed instances as ObjectRecord entries.
   void processInstances(viewer3d::domain::SceneSnapshot& snapshot);
 
-  // Process all nets and their routing
+  // Append routed net geometry (wire segments and vias).
   void processNets(viewer3d::domain::SceneSnapshot& snapshot);
 
-  // Process all block terminals (pins)
+  // Append top-level block terminals and pin geometry.
   void processPins(viewer3d::domain::SceneSnapshot& snapshot);
 
-  // Process blockages
+  // Append placement/routing blockage visualization objects.
   void processBlockages(viewer3d::domain::SceneSnapshot& snapshot);
 
-  // Process DRC markers
+  // Append DRC markers from the design database.
   void processDrcMarkers(viewer3d::domain::SceneSnapshot& snapshot);
 
-  // Process track grids
+  // Append routing track guides as helper visualization objects.
   void processTrackGrids(viewer3d::domain::SceneSnapshot& snapshot);
 
-  // Create or get a layer record for the given layer name
+  // Fetch an existing layer record or create a new one in snapshot.layers.
+  // zBase is stored in microns and should be the layer center Z.
   viewer3d::domain::LayerRecord* getOrCreateLayer(
       viewer3d::domain::SceneSnapshot& snapshot,
       const std::string& layerName,
       float zBase);
 
-  // Convert db units to microns
+  // Convert ODB DBU coordinates to microns.
   float dbuToMicrons(int dbu) const;
 
-  // Generate unique object ID
+  // Generate a monotonically increasing object id for temporary records.
   std::string generateObjectId(const std::string& prefix);
 
+  // Non-owning pointer managed by OpenROAD/ODB lifetime.
   odb::dbDatabase* db_;
+  // Cached DBU scale factor for coordinate conversion.
   int db_units_per_micron_ = 0;
+  // Internal counter for generated object ids.
   int object_id_counter_ = 0;
 };
 

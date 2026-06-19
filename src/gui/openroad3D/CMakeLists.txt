@@ -45,6 +45,8 @@ set(OPENROAD3D_SOURCES
     render/backend_osg/OsgFontAtlas.h
     render/backend_osg/OsgTextGeode.cpp
     render/backend_osg/OsgTextGeode.h
+    render/backend_osg/SpatialIndex.cpp
+    render/backend_osg/SpatialIndex.h
 )
 
 add_executable(openroad_3d ${OPENROAD3D_SOURCES})

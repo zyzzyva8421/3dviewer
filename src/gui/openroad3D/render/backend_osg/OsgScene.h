@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <mutex>
 
 #include <osg/ref_ptr>
 #include <osg/Object>
@@ -20,6 +21,7 @@
 #include "render/api/ILight.h"
 #include "render/api/ITexture.h"
 #include "core/domain/SceneTypes.h"
+#include "SpatialIndex.h"
 
 namespace osg {
 class Node;
@@ -35,6 +37,34 @@ class LOD;
 namespace viewer3d {
 namespace render {
 namespace backend_osg {
+
+// ============================================================
+// BATCHING: Per-layer geometry batch for Wire and Via objects
+// ============================================================
+struct BatchPrimitive {
+    std::string objectId;
+    uint32_t triStart = 0;
+    uint32_t triCount = 0;
+};
+
+struct LayerBatch {
+    std::string batchKey;
+    std::string layerId;
+    domain::ObjectType type = domain::ObjectType::Unknown;
+    osg::ref_ptr<osg::Geode> geode;
+    osg::ref_ptr<osg::Geometry> geometry;
+    std::vector<BatchPrimitive> primitives;
+    std::vector<const domain::ObjectRecord*> objects;
+
+    const std::string* findObjectIdByTri(uint32_t triIdx) const {
+        for (const auto& p : primitives) {
+            if (triIdx >= p.triStart && triIdx < p.triStart + p.triCount)
+                return &p.objectId;
+        }
+        return nullptr;
+    }
+};
+
 
 class OsgGeometry;
 class OsgMaterial;
@@ -113,6 +143,11 @@ public:
     const domain::LayerRecord* getLayer(const std::string& layerId) const override;
     ISceneObject* raycast(const Vec3& origin, const Vec3& direction, float maxDistance) override;
     void getBoundingBox(Vec3& min, Vec3& max) const override;
+    // ============================================================
+    // PERFORMANCE TUNING: Frustum update throttle
+    // ============================================================
+    // Update frequency is controlled by OsgBackend FRUSTUM_UPDATE_INTERVAL_FRAMES
+    // and FRUSTUM_UPDATE_THRESHOLD. Default: every 8 frames or 1.5 units change.
     
     // ========== IGeometryFactory ==========
     IGeometry* createCube(float width, float height, float depth) override;
@@ -156,6 +191,7 @@ public:
     void removeLayersById(const std::vector<std::string>& layerIds);
     void setSelectedObject(const std::string& objectId);
     osg::Node* getObjectNode(const std::string& objectId) const;
+    const std::string* findBatchObjectId(osg::Geode* geode, uint32_t triIdx) const;
     
     osg::Group* getObjectRoot() const { return objectRoot_.get(); }
     osg::Switch* getHighlightRoot() const { return highlightRoot_.get(); }
@@ -178,6 +214,27 @@ public:
     // Find object info from screen coords (for tooltips)
     std::string findObjectIdAtScreen(float nx, float ny) const;
 
+    // Update frustum from camera matrices for culling
+    void updateFrustum(const double* viewMatrix, const double* projectionMatrix);
+
+    // Get objects visible in current frustum
+    void getVisibleObjects(std::vector<std::string>& visibleIds);
+
+    // Lazy load: ensure OSG nodes exist for all visible objects
+    void ensureObjectsInFrustum();
+
+    // Enable/disable frustum culling
+    void setFrustumCullingEnabled(bool enabled) { frustumCullingEnabled_ = enabled; }
+    bool isFrustumCullingEnabled() const { return frustumCullingEnabled_; }
+
+    // Enable/disable lazy loading
+    void setLazyLoadEnabled(bool enabled) { lazyLoadEnabled_ = enabled; }
+    bool isLazyLoadEnabled() const { return lazyLoadEnabled_; }
+
+    // Get count of loaded vs total objects
+    size_t getLoadedObjectCount() const { return loadedObjectIds_.size(); }
+    size_t getTotalObjectCount() const { return pendingObjects_ ? pendingObjects_->size() : 0; }
+
 private:
     osg::ref_ptr<osg::Group> objectRoot_;
     osg::ref_ptr<osg::Switch> highlightRoot_;
@@ -187,6 +244,7 @@ private:
     std::unordered_map<std::string, domain::LayerRecord> layers_;
     std::unordered_map<std::string, osg::ref_ptr<osg::Node>> highlightNodes_;
     std::string previousSelectedId_;
+    std::string selectedObjectId_;  // Currently selected object (for raycast skipping)
     
     // Name label display state
     bool displayNamesVisible_ = false;
@@ -203,7 +261,10 @@ private:
     // Stipple texture cache: pattern name → RGBA texture
     std::unordered_map<std::string, osg::ref_ptr<osg::Texture2D>> stippleTextures_;
 
-    // Hidden objects (excluded from selection + visibility)
+    // StateSet cache: key = "layerId_objectType", value = shared StateSet
+    std::unordered_map<std::string, osg::ref_ptr<osg::StateSet>> layerStateSetCache_;
+
+    // Set of object IDs hidden by user (excluded from selection + visibility)
     std::unordered_set<std::string> hiddenObjects_;
 
     std::vector<osg::ref_ptr<osg::Light>> lights_;
@@ -219,6 +280,9 @@ private:
     void configureGeodeRenderState(osg::Geode* geode,
                                    const domain::LayerRecord& layer,
                                    domain::ObjectType objectType);
+    // Get cached StateSet for layer+objectType (avoids per-object allocation)
+    osg::StateSet* getOrCreateLayerStateSet(const domain::LayerRecord& layer,
+                                             domain::ObjectType objectType);
     osg::Geometry* createBoxGeometry(float x, float y, float width, float height, float depth);
     osg::Geometry* createPolylineGeometry(const domain::ObjectRecord& obj, const domain::LayerRecord* layer, float xOffset = 0.0f, float yOffset = 0.0f);
     osg::Geometry* createPolygonGeometry(const std::vector<osg::Vec2>& points, float thickness);
@@ -252,15 +316,54 @@ private:
                                     const osg::Vec4& color,
                                     const osg::Quat& rotation);
 
-    // DEBUG: colored marker box at text position for visual verification
-    osg::Node* makeMarkerBox(float cx, float cy, float cz,
-                             const osg::Vec4& color,
-                             const osg::Quat& rotation);
     osg::Quat computeFaceRotation(LabelFace face,
                                   bool textAlongX,
                                   float xlen,
                                   float ylen,
                                   float zlen) const;
+
+    // Spatial index for efficient frustum culling
+    SpatialIndex spatialIndex_;
+    // Current frustum for culling
+    Frustum currentFrustum_;
+    // Frustum culling enabled flag
+    bool frustumCullingEnabled_ = true;  // Enable for debugging
+
+    // Batching: build per-layer geometry batches for Wire+Via
+    void buildBatches(const domain::SceneSnapshot& snapshot);
+    void rebuildBatch(const std::string& batchKey);
+    static void appendBoxToBatch(osg::Vec3Array* verts, osg::Vec3Array* norms,
+                                  osg::DrawElementsUInt* tris,
+                                  float x, float y, float w, float h, float d,
+                                  uint32_t vertOffset, float zOffset = 0.0f);
+    static void appendWireToBatch(osg::Vec3Array* verts, osg::Vec3Array* norms,
+                                   osg::DrawElementsUInt* tris,
+                                   const domain::ObjectRecord& obj,
+                                   const domain::LayerRecord* layer,
+                                   uint32_t vertOffset, float zOffset = 0.0f);
+
+    // Lazy loading: pointer to backend's snapshot_.objects (eliminates redundant copy).
+    // The backing vector is pre-reserved to prevent pointer invalidation on push_back.
+    const std::vector<domain::ObjectRecord>* pendingObjects_ = nullptr;
+    std::unordered_set<std::string> loadedObjectIds_;
+    std::unordered_map<std::string, const domain::ObjectRecord*> objectIndexById_;  // Fast lookup by ptr
+    bool lazyLoadEnabled_ = true;  // Enable for debugging
+
+    // Batched geometry storage: key = "layerId_typeInt"
+    std::unordered_map<std::string, LayerBatch> layerBatches_;
+    std::unordered_map<const osg::Geode*, std::string> batchGeodeToKey_;
+    // Reverse index: objectId -> batchKey for O(1) lookup in setObjectVisible
+    std::unordered_map<std::string, std::string> objectIdToBatchKey_;
+
+    // Thread safety for batch operations (mutable for const methods)
+    mutable std::mutex batchMutex_;
+
+    // ============================================================
+    // PERFORMANCE TUNING: Per-frame object load cap
+    // ============================================================
+    // kMaxObjectsPerFrame caps how many new OSG scene-graph nodes
+    // ensureObjectsInFrustum() creates in a single call.
+    static constexpr size_t kMaxObjectsPerFrame = 50000;
 };
 
 }  // namespace backend_osg

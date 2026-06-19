@@ -216,7 +216,21 @@ class OsgBackend : public IRenderBackend {
   float distance_ = 100.0F;
   osg::Vec3 center_;
   osg::Vec3 eye_;
-  
+
+  // Throttle frustum updates during interaction
+  osg::Vec3 lastFrustumUpdateCenter_;
+  float lastFrustumUpdateDistance_ = 0.0F;
+  int lastFrustumUpdateFrame_ = 0;
+  // ============================================================
+  // PERFORMANCE TUNING: Frustum update throttle
+  // ============================================================
+  // Higher interval = fewer frustum culling updates = smoother interaction
+  // on large designs. Lower interval = more responsive culling = better
+  // on small designs where individual objects matter.
+  // Threshold is the minimum camera distance/center change to force an update.
+  static constexpr int FRUSTUM_UPDATE_INTERVAL_FRAMES = 8;
+  static constexpr float FRUSTUM_UPDATE_THRESHOLD = 1.5f;
+
   bool shadowEnabled_ = false;
   
   // English comment.
